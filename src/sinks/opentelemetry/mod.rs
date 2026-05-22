@@ -25,6 +25,7 @@ use crate::{
 
 pub use grpc::GrpcCompression;
 use grpc::GrpcSinkConfig;
+pub use crate::sinks::util::local_credential::LocalCredentialConfig;
 
 /// Transport protocol for the OpenTelemetry sink.
 #[configurable_component]
@@ -113,6 +114,13 @@ pub struct OpenTelemetryConfig {
     #[serde(default)]
     pub request: RequestConfig,
 
+    /// Fetch a short-lived credential from a local HTTP issuer before each export and attach it
+    /// as gRPC metadata (or an HTTP header for the `http` protocol).
+    ///
+    #[configurable(derived)]
+    #[serde(default)]
+    pub local_credential: Option<LocalCredentialConfig>,
+
     #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
@@ -159,6 +167,7 @@ impl SinkConfig for OpenTelemetryConfig {
                     payload_suffix: payload_suffix.clone(),
                     batch: *batch,
                     request: self.request.clone(),
+                    local_credential: self.local_credential.clone(),
                     tls: self.tls.clone(),
                     acknowledgements: self.acknowledgements,
                     retry_strategy: Default::default(),
@@ -180,6 +189,7 @@ impl SinkConfig for OpenTelemetryConfig {
                     compression: grpc_compression,
                     batch: *batch,
                     request: self.request.clone(),
+                    local_credential: self.local_credential.clone(),
                     tls: self.tls.clone(),
                     acknowledgements: self.acknowledgements,
                 };

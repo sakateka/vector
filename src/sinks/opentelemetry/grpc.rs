@@ -37,6 +37,10 @@ use vector_lib::{
     stream::{BatcherSettings, DriverResponse},
 };
 
+use crate::sinks::util::local_credential::{
+    LocalCredentialConfig, LocalCredentialProvider, SharedLocalCredentialProvider,
+};
+
 use crate::{
     config::{AcknowledgementsConfig, SinkContext, SinkHealthcheckOptions},
     event::{Event, EventFinalizers, EventStatus, Finalizable},
@@ -99,6 +103,10 @@ pub(super) struct GrpcSinkConfig {
     #[configurable(derived)]
     #[serde(default)]
     pub request: RequestConfig,
+
+    #[configurable(derived)]
+    #[serde(default)]
+    pub local_credential: Option<LocalCredentialConfig>,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -171,6 +179,13 @@ impl GrpcSinkConfig {
             dynamic_grpc_header_templates.push((key, t));
         }
 
+        let local_credential = self
+            .local_credential
+            .as_ref()
+            .map(LocalCredentialProvider::try_from_config)
+            .transpose()?
+            .map(std::sync::Arc::new);
+
         let client = new_grpc_client(&tls, cx.proxy())?;
         // Dynamic headers cannot be rendered without a live event, so the healthcheck cannot
         // include them. Rather than running a check that omits required auth metadata (which
@@ -210,9 +225,10 @@ impl GrpcSinkConfig {
             client.clone(),
             healthcheck_uri,
             static_grpc_headers.clone(),
+            local_credential.clone(),
             cx.healthcheck,
         ));
-        let service = OtlpGrpcService::new(client, use_gzip, static_grpc_headers);
+        let service = OtlpGrpcService::new(client, use_gzip, static_grpc_headers, local_credential);
 
         let request_settings = self.request.tower.into_settings();
         let batch_settings = self.batch.into_batcher_settings()?;
@@ -244,10 +260,11 @@ fn new_grpc_client(
 async fn grpc_healthcheck(
     client: hyper::Client<ProxyConnector<HttpsConnector<HttpConnector>>, BoxBody>,
     uri: Option<Uri>,
-    headers: Vec<(
+    mut headers: Vec<(
         tonic::metadata::AsciiMetadataKey,
         tonic::metadata::AsciiMetadataValue,
     )>,
+    local_credential: Option<SharedLocalCredentialProvider>,
     options: SinkHealthcheckOptions,
 ) -> crate::Result<()> {
     if !options.enabled {
@@ -257,6 +274,10 @@ async fn grpc_healthcheck(
     let Some(uri) = uri else {
         return Ok(());
     };
+
+    if let Some(provider) = local_credential {
+        headers.push(provider.fetch_grpc_metadata().await?);
+    }
 
     use tonic::Code;
     use tonic_health::pb::{HealthCheckRequest, health_client::HealthClient};
@@ -301,6 +322,8 @@ impl RetryLogic for OtlpGrpcRetryLogic {
         use tonic::Code::*;
 
         match err {
+            // Issuer unreachable, timeout, or malformed response — safe to retry.
+            OtlpGrpcError::Credential { .. } => true,
             OtlpGrpcError::Request { source } => !matches!(
                 source.code(),
                 // List taken from
@@ -328,6 +351,9 @@ impl RetryLogic for OtlpGrpcRetryLogic {
 enum OtlpGrpcError {
     #[snafu(display("gRPC request failed: {source}"))]
     Request { source: tonic::Status },
+
+    #[snafu(display("failed to fetch local credential: {message}"))]
+    Credential { message: String },
 }
 
 // ── Request/Response ─────────────────────────────────────────────────────────
@@ -419,6 +445,7 @@ struct OtlpGrpcService {
             tonic::metadata::AsciiMetadataValue,
         )>,
     >,
+    local_credential: Option<SharedLocalCredentialProvider>,
 }
 
 impl OtlpGrpcService {
@@ -429,12 +456,14 @@ impl OtlpGrpcService {
             tonic::metadata::AsciiMetadataKey,
             tonic::metadata::AsciiMetadataValue,
         )>,
+        local_credential: Option<SharedLocalCredentialProvider>,
     ) -> Self {
         Self {
             clients: None,
             hyper_client,
             compression,
             headers: std::sync::Arc::new(headers),
+            local_credential,
         }
     }
 
@@ -481,10 +510,24 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
         // Rebuild clients if the URI changed; clone only the client for this signal type.
         let client = self.client_for_signal(&req.uri, &req.signal);
         let static_headers = std::sync::Arc::clone(&self.headers);
+        let local_credential = self.local_credential.clone();
         let metadata = std::mem::take(req.metadata_mut());
         let events_byte_size = metadata.into_events_estimated_json_encoded_byte_size();
 
         let future = async move {
+            let credential_header = if let Some(provider) = local_credential {
+                Some(
+                    provider
+                        .fetch_grpc_metadata()
+                        .await
+                        .map_err(|e| OtlpGrpcError::Credential {
+                            message: e.to_string(),
+                        })?,
+                )
+            } else {
+                None
+            };
+
             macro_rules! export {
                 ($client:expr, $payload:expr) => {{
                     let len = $payload.encoded_len();
@@ -493,6 +536,9 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
                         grpc_req.metadata_mut().insert(key.clone(), value.clone());
                     }
                     for (key, value) in &req.dynamic_headers {
+                        grpc_req.metadata_mut().insert(key.clone(), value.clone());
+                    }
+                    if let Some((key, value)) = &credential_header {
                         grpc_req.metadata_mut().insert(key.clone(), value.clone());
                     }
                     let response = $client

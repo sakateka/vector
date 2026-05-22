@@ -140,3 +140,10 @@ impl Partitioner for KeyPartitioner {
         Some(PartitionKey { uri, headers })
     }
 }
+
+#[cfg(feature = "sinks-opentelemetry")]
+impl crate::sinks::util::local_credential::LocalCredentialRequestMetadata for PartitionKey {
+    fn insert_request_header(&mut self, name: &str, value: String) {
+        self.headers.insert(name.to_owned(), value);
+    }
+}

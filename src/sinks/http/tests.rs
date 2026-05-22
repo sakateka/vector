@@ -65,6 +65,8 @@ fn default_cfg(encoding: EncodingConfigWithFraming) -> HttpSinkConfig {
         payload_suffix: Default::default(),
         batch: Default::default(),
         request: Default::default(),
+        #[cfg(feature = "sinks-opentelemetry")]
+        local_credential: None,
         tls: Default::default(),
         acknowledgements: Default::default(),
         retry_strategy: Default::default(),

@@ -891,6 +891,10 @@ impl<T: Send> HttpRequest<T> {
         &self.additional_metadata
     }
 
+    pub fn additional_metadata_mut(&mut self) -> &mut T {
+        &mut self.additional_metadata
+    }
+
     pub fn take_payload(&mut self) -> Bytes {
         std::mem::take(&mut self.payload)
     }
@@ -995,6 +999,38 @@ where
             let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
                 Box::pin(async move { request_builder.build(req) });
 
+            fut
+        });
+        Self {
+            batch_service,
+            _phantom: PhantomData,
+        }
+    }
+
+    /// Like [`Self::new`], but fetches a credential from a local issuer before each request and
+    /// attaches it to the request metadata.
+    #[cfg(feature = "sinks-opentelemetry")]
+    pub fn new_with_local_credential(
+        http_client: HttpClient<Body>,
+        http_request_builder: B,
+        local_credential: crate::sinks::util::local_credential::SharedLocalCredentialProvider,
+    ) -> Self
+    where
+        T: crate::sinks::util::local_credential::LocalCredentialRequestMetadata + Send + 'static,
+    {
+        let http_request_builder = Arc::new(http_request_builder);
+
+        let batch_service = HttpBatchService::new(http_client, move |mut req: HttpRequest<T>| {
+            let request_builder = Arc::clone(&http_request_builder);
+            let local_credential = std::sync::Arc::clone(&local_credential);
+
+            let fut: BoxFuture<'static, Result<http::Request<Bytes>, crate::Error>> =
+                Box::pin(async move {
+                    let value = local_credential.fetch().await?;
+                    req.additional_metadata_mut()
+                        .insert_request_header(local_credential.header_name(), value);
+                    request_builder.build(req)
+                });
             fut
         });
         Self {

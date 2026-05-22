@@ -61,6 +61,8 @@ fn benchmark_http(c: &mut Criterion) {
                                 encoding: (None::<FramingConfig>, TextSerializerConfig::default())
                                     .into(),
                                 request: Default::default(),
+                                #[cfg(feature = "sinks-opentelemetry")]
+                                local_credential: None,
                                 tls: Default::default(),
                                 acknowledgements: Default::default(),
                                 retry_strategy: Default::default(),

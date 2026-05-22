@@ -93,6 +93,13 @@ pub struct HttpSinkConfig {
     #[serde(default)]
     pub request: RequestConfig,
 
+    /// Fetch a short-lived credential from a local HTTP issuer before each request and attach it
+    /// as an HTTP header.
+    #[cfg(feature = "sinks-opentelemetry")]
+    #[configurable(derived)]
+    #[serde(default)]
+    pub local_credential: Option<crate::sinks::util::local_credential::LocalCredentialConfig>,
+
     #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
@@ -181,13 +188,30 @@ impl GenerateConfig for HttpSinkConfig {
     }
 }
 
-async fn healthcheck(uri: UriSerde, auth: Option<Auth>, client: HttpClient) -> crate::Result<()> {
+async fn healthcheck(
+    uri: UriSerde,
+    auth: Option<Auth>,
+    client: HttpClient,
+    #[cfg(feature = "sinks-opentelemetry")] local_credential: Option<
+        crate::sinks::util::local_credential::SharedLocalCredentialProvider,
+    >,
+) -> crate::Result<()> {
     let auth = auth.choose_one(&uri.auth)?;
     let uri = uri.with_default_parts();
     let mut request = Request::head(&uri.uri).body(Body::empty()).unwrap();
 
     if let Some(auth) = auth {
         auth.apply(&mut request);
+    }
+
+    #[cfg(feature = "sinks-opentelemetry")]
+    if let Some(provider) = local_credential {
+        let value = provider.fetch().await?;
+        let header_name = http::HeaderName::from_bytes(provider.header_name().as_bytes())
+            .map_err(|e| format!("invalid credential header name: {e}"))?;
+        let header_value =
+            http::HeaderValue::from_str(&value).map_err(|e| format!("invalid credential header value: {e}"))?;
+        request.headers_mut().insert(header_name, header_value);
     }
 
     let response = client.send(request).await?;
@@ -252,9 +276,30 @@ impl SinkConfig for HttpSinkConfig {
 
         let client = self.build_http_client(&cx)?;
 
+        #[cfg(feature = "sinks-opentelemetry")]
+        let local_credential = self
+            .local_credential
+            .as_ref()
+            .map(crate::sinks::util::local_credential::LocalCredentialProvider::try_from_config)
+            .transpose()?
+            .map(std::sync::Arc::new);
+
         let healthcheck = match cx.healthcheck.uri {
             Some(healthcheck_uri) => {
-                healthcheck(healthcheck_uri, self.auth.clone(), client.clone()).boxed()
+                #[cfg(feature = "sinks-opentelemetry")]
+                {
+                    healthcheck(
+                        healthcheck_uri,
+                        self.auth.clone(),
+                        client.clone(),
+                        local_credential.clone(),
+                    )
+                    .boxed()
+                }
+                #[cfg(not(feature = "sinks-opentelemetry"))]
+                {
+                    healthcheck(healthcheck_uri, self.auth.clone(), client.clone()).boxed()
+                }
             }
             None => future::ok(()).boxed(),
         };
@@ -331,7 +376,24 @@ impl SinkConfig for HttpSinkConfig {
                     },
                 )
             }
-            _ => HttpService::new(client, http_sink_request_builder),
+            _ => {
+                #[cfg(feature = "sinks-opentelemetry")]
+                {
+                    if let Some(provider) = local_credential {
+                        HttpService::new_with_local_credential(
+                            client,
+                            http_sink_request_builder,
+                            provider,
+                        )
+                    } else {
+                        HttpService::new(client, http_sink_request_builder)
+                    }
+                }
+                #[cfg(not(feature = "sinks-opentelemetry"))]
+                {
+                    HttpService::new(client, http_sink_request_builder)
+                }
+            }
         };
 
         let request_limits = self.request.tower.into_settings();
@@ -411,6 +473,8 @@ mod tests {
                 compression: Compression::default(),
                 batch: BatchConfig::default(),
                 request: RequestConfig::default(),
+                #[cfg(feature = "sinks-opentelemetry")]
+                local_credential: None,
                 tls: None,
                 acknowledgements: AcknowledgementsConfig::default(),
                 payload_prefix: String::new(),

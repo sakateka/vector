@@ -11,6 +11,8 @@ pub mod compressor;
 pub mod datagram;
 pub mod encoding;
 pub mod http;
+#[cfg(feature = "sinks-opentelemetry")]
+pub mod local_credential;
 pub mod metadata;
 pub mod normalizer;
 pub mod partitioner;

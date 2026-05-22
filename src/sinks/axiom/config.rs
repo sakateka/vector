@@ -186,6 +186,8 @@ impl SinkConfig for AxiomConfig {
             payload_prefix: "".into(), // Always newline delimited JSON
             payload_suffix: "".into(), // Always newline delimited JSON
             retry_strategy: self.retry_strategy.clone(),
+            #[cfg(feature = "sinks-opentelemetry")]
+            local_credential: None,
         };
 
         http_sink_config.build(cx).await
