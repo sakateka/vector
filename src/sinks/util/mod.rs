@@ -19,6 +19,8 @@ pub mod http;
     feature = "sinks-keep",
 ))]
 pub(crate) mod http_v1;
+#[cfg(feature = "sinks-opentelemetry")]
+pub mod local_credential;
 pub mod metadata;
 pub mod normalizer;
 pub mod partitioner;

@@ -75,6 +75,8 @@ fn default_cfg(encoding: EncodingConfigWithFraming) -> HttpSinkConfig {
         acknowledgements: AcknowledgementsConfig::default(),
         retry_strategy: crate::sinks::util::http::RetryStrategy::default(),
         confinement: crate::template::ConfinementConfig::default(),
+        #[cfg(feature = "sinks-opentelemetry")]
+        local_credential: None,
     }
 }
 

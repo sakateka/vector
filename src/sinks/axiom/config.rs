@@ -243,6 +243,8 @@ impl AxiomConfig {
             payload_prefix: String::new(), // Always newline delimited JSON
             payload_suffix: String::new(), // Always newline delimited JSON
             retry_strategy: self.retry_strategy.clone(),
+            #[cfg(feature = "sinks-opentelemetry")]
+            local_credential: None,
             confinement: self.confinement.clone(),
         }
     }
