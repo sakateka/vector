@@ -84,3 +84,5 @@ agents/reports/
 
 # stray rlib build artifacts
 *.rlib
+
+*.rej

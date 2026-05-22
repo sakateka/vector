@@ -44,12 +44,11 @@ sinks:
     inputs:
       - source0.logs
     type: opentelemetry
-    protocol:
-      type: http
-      uri: http://otel-collector-sink:5318/v1/logs
-      method: post
-      encoding:
-        codec: otlp
+    protocol: http
+    uri: http://otel-collector-sink:5318/v1/logs
+    method: post
+    encoding:
+      codec: otlp
 ```
 
 The above configuration requires Vector `0.60.0` or later. For earlier versions, use
@@ -65,21 +64,20 @@ otel_sink:
   inputs:
     - otel.logs
   type: opentelemetry
-  protocol:
-    type: http
-    uri: http://localhost:5318/v1/logs
-    method: post
-    encoding:
-      codec: protobuf
-      protobuf:
-        desc_file: path/to/opentelemetry-proto.desc
-        message_type: opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest
-        use_json_names: true
-    framing:
-      method: 'bytes'
-    request:
-      headers:
-        content-type: 'application/x-protobuf'
+  protocol: http
+  uri: http://localhost:5318/v1/logs
+  method: post
+  encoding:
+    codec: protobuf
+    protobuf:
+      desc_file: path/to/opentelemetry-proto.desc
+      message_type: opentelemetry.proto.collector.logs.v1.ExportLogsServiceRequest
+      use_json_names: true
+  framing:
+    method: 'bytes'
+  request:
+    headers:
+      content-type: 'application/x-protobuf'
 ```
 
 The `desc` file was generated with the following command:
