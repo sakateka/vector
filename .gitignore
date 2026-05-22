@@ -71,3 +71,4 @@ local/
 
 # vscode
 .vscode/
+*.rej
