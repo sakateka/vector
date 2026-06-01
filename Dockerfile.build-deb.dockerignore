@@ -1,0 +1,41 @@
+# Build context filter for Dockerfile.build-deb.
+#
+# BuildKit uses "<dockerfile>.dockerignore" in preference to .dockerignore, so
+# this file governs the context for `docker build -f Dockerfile.build-deb .`
+# without touching the repo's existing .dockerignore (used by other builds).
+#
+# Strategy: ignore everything, then whitelist exactly what the native .deb
+# release path needs (Makefiles, build inputs, and the files packaged into the
+# tar.gz / consumed by scripts/package-deb.sh).
+
+*
+
+# Cargo workspace + sources (your patched code lives here)
+!benches
+!lib
+!proto
+!src
+!tests
+!build.rs
+!Cargo.lock
+!Cargo.toml
+!rust-toolchain.toml
+
+# Build tooling
+!Makefile
+!Makefile.packaging
+!scripts
+!vdev
+
+# Files copied into the tar.gz and used by scripts/package-deb.sh
+!config
+!distribution
+!README.md
+!LICENSE
+!NOTICE
+!LICENSE-3rdparty.csv
+!licenses
+
+# Never ship build artifacts even if a parent rule would include them.
+target
+**/target
