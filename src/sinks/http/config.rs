@@ -209,8 +209,8 @@ async fn healthcheck(
         let value = provider.fetch().await?;
         let header_name = http::HeaderName::from_bytes(provider.header_name().as_bytes())
             .map_err(|e| format!("invalid credential header name: {e}"))?;
-        let header_value =
-            http::HeaderValue::from_str(&value).map_err(|e| format!("invalid credential header value: {e}"))?;
+        let header_value = http::HeaderValue::from_str(&value)
+            .map_err(|e| format!("invalid credential header value: {e}"))?;
         request.headers_mut().insert(header_name, header_value);
     }
 

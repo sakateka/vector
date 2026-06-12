@@ -14,6 +14,7 @@ For example:
 
 ## To be deprecated
 
+- `v0.59.0` | `opentelemetry-nested-protocol` | The nested `protocol.*` configuration format for the `opentelemetry` sink is deprecated. Move all fields from `protocol.*` to the top level and replace `protocol.type` with `protocol`.
 - `v0.50.0` | `http-server-encoding` | The `encoding` field will be removed. Use `decoding` and `framing` instead.
 - `v0.53.0` | `buffer-bytes-events-metrics` | The `buffer_byte_size` and `buffer_events` gauges are deprecated in favor of the `buffer_size_bytes`/`buffer_size_events` metrics described in `docs/specs/buffer.md`.
 - `v0.58.0` | `azure-monitor-logs-sink` | The `azure_monitor_logs` sink is deprecated in favor of the new `azure_logs_ingestion` sink, which uses the Azure Monitor Logs Ingestion API. Users should migrate before Microsoft ends support for the old Data Collector API (scheduled for September 2026).

@@ -780,6 +780,67 @@ generated: components: sinks: http: configuration: {
 			}
 		}
 	}
+	local_credential: {
+		description: """
+			Fetch a short-lived credential from a local HTTP issuer before each request and attach it
+			as an HTTP header.
+			"""
+		required: false
+		type: object: options: {
+			authorization_env: {
+				description: """
+					Optional environment variable whose value is sent as the `Authorization` header when
+					requesting credentials from the issuer.
+					"""
+				required: false
+				type: string: {}
+			}
+			destination: {
+				description: """
+					Destination identity sent as the `dsts` query parameter and used as the top-level JSON key
+					when reading the response.
+					"""
+				required: true
+				type: string: {}
+			}
+			endpoint: {
+				description: """
+					Base URL of the local credential issuer (scheme, host, and port).
+
+					# Examples
+
+					- `http://127.0.0.1:8080`
+					- `http://localhost:8080`
+					"""
+				required: true
+				type: string: examples: ["http://127.0.0.1:8080"]
+			}
+			header: {
+				description: "Request metadata / header name used to attach the fetched credential."
+				required:    true
+				type: string: examples: ["x-custom-auth"]
+			}
+			issuer_request_headers: {
+				description: "Additional HTTP headers to send when requesting credentials from the issuer."
+				required:    false
+				type: object: options: "*": {
+					description: "An HTTP header name and value."
+					required:    true
+					type: string: {}
+				}
+			}
+			path: {
+				description: "HTTP path on the issuer used to request credentials."
+				required:    false
+				type: string: default: "/v2/tickets"
+			}
+			source: {
+				description: "Source identity sent as the `self` query parameter."
+				required:    true
+				type: string: {}
+			}
+		}
+	}
 	method: {
 		description: "The HTTP method to use when making the request."
 		required:    false
