@@ -73,27 +73,26 @@ impl LocalCredentialProvider {
             pairs.append_pair("dsts", &config.destination);
         }
 
-        http::header::HeaderName::from_bytes(config.header.as_bytes()).map_err(|e| {
-            format!("invalid credential header name {:?}: {e}", config.header)
-        })?;
+        http::header::HeaderName::from_bytes(config.header.as_bytes())
+            .map_err(|e| format!("invalid credential header name {:?}: {e}", config.header))?;
 
         let header_lower = config.header.to_lowercase();
-        let grpc_metadata_key =
-            tonic::metadata::AsciiMetadataKey::from_bytes(header_lower.as_bytes()).map_err(|e| {
-                format!(
-                    "credential header {:?} is not valid gRPC metadata: {e}",
-                    config.header
-                )
-            })?;
+        let grpc_metadata_key = tonic::metadata::AsciiMetadataKey::from_bytes(
+            header_lower.as_bytes(),
+        )
+        .map_err(|e| {
+            format!(
+                "credential header {:?} is not valid gRPC metadata: {e}",
+                config.header
+            )
+        })?;
 
         let mut issuer_request_headers = reqwest::header::HeaderMap::new();
         for (name, value) in &config.issuer_request_headers {
-            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
-                format!("invalid issuer request header name {name:?}: {e}")
-            })?;
-            let value = reqwest::header::HeaderValue::from_str(value).map_err(|e| {
-                format!("invalid issuer request header value for {name:?}: {e}")
-            })?;
+            let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|e| format!("invalid issuer request header name {name:?}: {e}"))?;
+            let value = reqwest::header::HeaderValue::from_str(value)
+                .map_err(|e| format!("invalid issuer request header value for {name:?}: {e}"))?;
             issuer_request_headers.insert(name, value);
         }
 

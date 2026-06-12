@@ -201,26 +201,25 @@ impl GrpcSinkConfig {
             .clone()
             .map(|u| u.uri)
             .or_else(|| static_uri.clone());
-        let healthcheck_uri = if !dynamic_grpc_header_templates.is_empty()
-            && raw_healthcheck_uri.is_none()
-        {
-            warn!(
-                "Skipping gRPC healthcheck: dynamic (templated) headers are configured and \
+        let healthcheck_uri =
+            if !dynamic_grpc_header_templates.is_empty() && raw_healthcheck_uri.is_none() {
+                warn!(
+                    "Skipping gRPC healthcheck: dynamic (templated) headers are configured and \
                  cannot be rendered at startup. Set a static `healthcheck.uri` override to \
                  re-enable the healthcheck."
-            );
-            None
-        } else if raw_healthcheck_uri.is_none() && self.uri.is_dynamic() {
-            warn!(
-                "Skipping gRPC healthcheck: `uri` is a dynamic template and no static \
+                );
+                None
+            } else if raw_healthcheck_uri.is_none() && self.uri.is_dynamic() {
+                warn!(
+                    "Skipping gRPC healthcheck: `uri` is a dynamic template and no static \
                  `healthcheck.uri` override is set. To enable healthchecking, use a static URI."
-            );
-            None
-        } else {
-            raw_healthcheck_uri
-                .map(|u| with_default_scheme(u, tls_configured))
-                .transpose()?
-        };
+                );
+                None
+            } else {
+                raw_healthcheck_uri
+                    .map(|u| with_default_scheme(u, tls_configured))
+                    .transpose()?
+            };
         let healthcheck = Box::pin(grpc_healthcheck(
             client.clone(),
             healthcheck_uri,
@@ -516,14 +515,11 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
 
         let future = async move {
             let credential_header = if let Some(provider) = local_credential {
-                Some(
-                    provider
-                        .fetch_grpc_metadata()
-                        .await
-                        .map_err(|e| OtlpGrpcError::Credential {
-                            message: e.to_string(),
-                        })?,
-                )
+                Some(provider.fetch_grpc_metadata().await.map_err(|e| {
+                    OtlpGrpcError::Credential {
+                        message: e.to_string(),
+                    }
+                })?)
             } else {
                 None
             };
