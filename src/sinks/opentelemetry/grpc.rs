@@ -17,12 +17,12 @@ use tokio_util::codec::Encoder;
 use tonic::body::BoxBody;
 use tower::{Service, ServiceBuilder};
 use vector_lib::{
-    lookup::event_path,
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
     codecs::encoding::format::OtlpSerializer,
     config::telemetry,
     configurable::configurable_component,
     internal_event::{ComponentEventsDropped, UNINTENTIONAL},
+    lookup::event_path,
     opentelemetry::proto::{
         RESOURCE_LOGS_JSON_FIELD, RESOURCE_METRICS_JSON_FIELD, RESOURCE_SPANS_JSON_FIELD,
         collector::{
@@ -108,27 +108,21 @@ pub(super) struct GrpcSinkConfig {
     ))]
     pub uri: UriTemplate,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub compression: GrpcCompression,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub batch: BatchConfig<RealtimeEventBasedDefaultBatchSettings>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub request: RequestConfig,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub local_credential: Option<LocalCredentialConfig>,
 
-    #[configurable(derived)]
     #[serde(default)]
     pub tls: Option<TlsConfig>,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -137,7 +131,7 @@ pub(super) struct GrpcSinkConfig {
     pub acknowledgements: AcknowledgementsConfig,
 
     /// Template confinement settings for outbound URI and metadata values.
-    #[configurable(derived)]
+
     #[serde(flatten)]
     pub confinement: ConfinementConfig,
 }
@@ -146,7 +140,10 @@ pub(super) struct GrpcSinkConfig {
 pub(super) struct ValidatedGrpc {
     uri_template: ConfinedUriTemplate,
     dynamic_header_templates: Vec<(tonic::metadata::AsciiMetadataKey, ConfinedTemplate)>,
-    static_grpc_headers: Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>,
+    static_grpc_headers: Vec<(
+        tonic::metadata::AsciiMetadataKey,
+        tonic::metadata::AsciiMetadataValue,
+    )>,
     batch_settings: BatcherSettings,
 }
 
@@ -158,7 +155,10 @@ impl GrpcSinkConfig {
         if !self.uri.is_dynamic() {
             with_default_scheme(self.uri.get_ref().parse()?, self.tls.is_some())?;
         }
-        let uri_template = self.uri.clone().confine(&self.confinement, "opentelemetry", "uri")?;
+        let uri_template = self
+            .uri
+            .clone()
+            .confine(&self.confinement, "opentelemetry", "uri")?;
         let (static_headers, dynamic_headers) = self.request.split_headers();
         let mut static_grpc_headers = Vec::with_capacity(static_headers.len());
         for (name, value) in static_headers {
@@ -172,7 +172,10 @@ impl GrpcSinkConfig {
         for (name, template) in dynamic_headers {
             let key = tonic::metadata::AsciiMetadataKey::from_bytes(name.to_lowercase().as_bytes())
                 .map_err(|e| format!("invalid gRPC metadata key {name:?}: {e}"))?;
-            dynamic_header_templates.push((key, template.confine(&self.confinement, "opentelemetry", "request.headers")?));
+            dynamic_header_templates.push((
+                key,
+                template.confine(&self.confinement, "opentelemetry", "request.headers")?,
+            ));
         }
         Ok(ValidatedGrpc {
             uri_template,
@@ -182,7 +185,11 @@ impl GrpcSinkConfig {
         })
     }
 
-    pub(super) async fn build_from_validated(&self, validated: &ValidatedGrpc, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    pub(super) async fn build_from_validated(
+        &self,
+        validated: &ValidatedGrpc,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
         // For static URIs, parse at build time for the healthcheck.
         // Dynamic URIs are rendered per-event during sink execution.
         let static_uri = if self.uri.is_dynamic() {
@@ -1161,23 +1168,29 @@ mod tests {
 
     #[test]
     fn validation_rejects_unconfined_grpc_header() {
-        let config: GrpcSinkConfig = toml::from_str(r#"
+        let config: GrpcSinkConfig = toml::from_str(
+            r#"
             uri = "http://localhost:4317"
             [request.headers]
             x-tenant = "{{ tenant }}"
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
         assert!(config.validate().is_err());
     }
 
     #[test]
     fn validation_confines_grpc_uri_at_render_time() {
-        let config: GrpcSinkConfig = toml::from_str(r#"uri = "http://localhost:4317/logs/{{ path }}""#).unwrap();
+        let config: GrpcSinkConfig =
+            toml::from_str(r#"uri = "http://localhost:4317/logs/{{ path }}""#).unwrap();
         let validated = config.validate().unwrap();
         let mut event = crate::event::LogEvent::default();
         event.insert(event_path!("path"), "tenant-a");
-        assert_eq!(validated.uri_template.render_string(&event).unwrap(), "http://localhost:4317/logs/tenant-a");
+        assert_eq!(
+            validated.uri_template.render_string(&event).unwrap(),
+            "http://localhost:4317/logs/tenant-a"
+        );
         event.insert(event_path!("path"), "../../admin");
         assert!(validated.uri_template.render_string(&event).is_err());
     }
-
 }

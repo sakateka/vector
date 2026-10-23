@@ -224,6 +224,7 @@ mod tests {
             (
                 FieldsSpec {
                     node_labels: OptionalTargetPath::none(),
+                    ..FieldsSpec::default()
                 },
                 ObjectMeta {
                     name: Some("sandbox0-name".to_owned()),
@@ -249,6 +250,7 @@ mod tests {
             (
                 FieldsSpec {
                     node_labels: OptionalTargetPath::none(),
+                    ..FieldsSpec::default()
                 },
                 ObjectMeta {
                     name: Some("sandbox0-name".to_owned()),
@@ -329,7 +331,10 @@ mod tests {
             annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
             let mut expected = LogEvent::default();
             if log_namespace == LogNamespace::Vector {
-                expected.insert(metadata_path!("kubernetes_logs", "node_labels", zone), "mow");
+                expected.insert(
+                    metadata_path!("kubernetes_logs", "node_labels", zone),
+                    "mow",
+                );
             }
             assert_eq!(log, expected);
         }

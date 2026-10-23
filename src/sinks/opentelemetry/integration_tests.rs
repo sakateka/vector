@@ -78,7 +78,9 @@ async fn delivers_logs_via_grpc() {
     ))
     .unwrap();
 
-    let (sink, healthcheck) = SinkConfig::build(&config, SinkContext::default()).await.unwrap();
+    let (sink, healthcheck) = SinkConfig::build(&config, SinkContext::default())
+        .await
+        .unwrap();
     healthcheck.await.expect("gRPC healthcheck failed");
 
     let events = vec![otlp_log_event()];
@@ -100,7 +102,9 @@ async fn delivers_logs_via_grpc_template_uri() {
     )
     .unwrap();
 
-    let (sink, healthcheck) = SinkConfig::build(&config, SinkContext::default()).await.unwrap();
+    let (sink, healthcheck) = SinkConfig::build(&config, SinkContext::default())
+        .await
+        .unwrap();
     // The URI is a dynamic template so there is no static healthcheck URI; the healthcheck
     // skips gracefully and returns Ok(()) rather than failing.
     healthcheck

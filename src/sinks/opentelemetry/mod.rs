@@ -42,11 +42,10 @@ pub enum OtlpProtocol {
         #[serde(default)]
         method: HttpMethod,
 
-        #[configurable(derived)]
         auth: Option<Auth>,
 
         /// Encoding configuration.
-        #[configurable(derived)]
+
         #[serde(flatten)]
         encoding: EncodingConfigWithFraming,
 
@@ -58,18 +57,15 @@ pub enum OtlpProtocol {
         #[serde(default)]
         payload_suffix: String,
 
-        #[configurable(derived)]
         #[serde(default)]
         batch: BatchConfig<RealtimeSizeBasedDefaultBatchSettings>,
 
-        #[configurable(derived)]
         #[serde(default)]
         retry_strategy: RetryStrategy,
     },
 
     /// Send OTLP data over gRPC.
     Grpc {
-        #[configurable(derived)]
         #[serde(default)]
         batch: BatchConfig<RealtimeEventBasedDefaultBatchSettings>,
     },
@@ -83,7 +79,7 @@ pub enum OtlpProtocol {
 #[derive(Clone, Debug)]
 pub struct OpenTelemetryConfig {
     /// The transport protocol to use.
-    #[configurable(derived)]
+
     #[serde(flatten)]
     pub protocol: OtlpProtocol,
 
@@ -106,14 +102,12 @@ pub struct OpenTelemetryConfig {
     ))]
     pub uri: UriTemplate,
 
-    #[configurable(derived)]
     #[configurable(metadata(
         docs::warnings = "The `grpc` protocol only supports `none`, `gzip`, and `zstd`. Specifying any other algorithm causes Vector to fail at startup."
     ))]
     #[serde(default)]
     pub compression: Compression,
 
-    #[configurable(derived)]
     #[configurable(metadata(
         docs::description = "Outbound request settings for retry, concurrency, timeout, and headers. \
         For the `grpc` protocol, `request.headers` entries are forwarded as gRPC metadata — use them \
@@ -126,14 +120,12 @@ pub struct OpenTelemetryConfig {
     /// Fetch a short-lived credential from a local HTTP issuer before each export and attach it
     /// as gRPC metadata (or an HTTP header for the `http` protocol).
     ///
-    #[configurable(derived)]
+
     #[serde(default)]
     pub local_credential: Option<LocalCredentialConfig>,
 
-    #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
-    #[configurable(derived)]
     #[serde(
         default,
         deserialize_with = "crate::serde::bool_or_struct",
@@ -142,7 +134,7 @@ pub struct OpenTelemetryConfig {
     pub acknowledgements: AcknowledgementsConfig,
 
     /// Template confinement settings for outbound URI and metadata values.
-    #[configurable(derived)]
+
     #[serde(flatten)]
     pub confinement: ConfinementConfig,
 }
@@ -298,8 +290,14 @@ pub struct ValidatedOpenTelemetry {
 
 #[derive(Clone, Debug)]
 enum ValidatedOtlpProtocol {
-    Http { config: HttpSinkConfig, validated: ValidatedHttp },
-    Grpc { config: GrpcSinkConfig, validated: grpc::ValidatedGrpc },
+    Http {
+        config: HttpSinkConfig,
+        validated: ValidatedHttp,
+    },
+    Grpc {
+        config: GrpcSinkConfig,
+        validated: grpc::ValidatedGrpc,
+    },
 }
 
 #[async_trait::async_trait]
@@ -366,14 +364,19 @@ impl ValidatedSink for OpenTelemetryConfig {
         }
     }
 
-
-    async fn build(&self, validated: &ValidatedOpenTelemetry, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    async fn build(
+        &self,
+        validated: &ValidatedOpenTelemetry,
+        cx: SinkContext,
+    ) -> crate::Result<(VectorSink, Healthcheck)> {
         match &validated.protocol {
             ValidatedOtlpProtocol::Http { config, validated } => {
                 warn_on_invalid_otlp_batching(config);
                 Box::pin(config.build_from_validated(validated, cx, Self::NAME)).await
             }
-            ValidatedOtlpProtocol::Grpc { config, validated } => config.build_from_validated(validated, cx).await,
+            ValidatedOtlpProtocol::Grpc { config, validated } => {
+                config.build_from_validated(validated, cx).await
+            }
         }
     }
 }

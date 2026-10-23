@@ -95,11 +95,9 @@ pub struct HttpSinkConfig {
     /// Fetch a short-lived credential from a local HTTP issuer before each request and attach it
     /// as an HTTP header.
     #[cfg(feature = "sinks-opentelemetry")]
-    #[configurable(derived)]
     #[serde(default)]
     pub local_credential: Option<crate::sinks::util::local_credential::LocalCredentialConfig>,
 
-    #[configurable(derived)]
     pub tls: Option<TlsConfig>,
 
     #[serde(
@@ -502,7 +500,13 @@ impl HttpSinkConfig {
             Some(healthcheck_uri) => {
                 #[cfg(feature = "sinks-opentelemetry")]
                 {
-                    healthcheck(healthcheck_uri, self.auth.clone(), client.clone(), local_credential.clone()).boxed()
+                    healthcheck(
+                        healthcheck_uri,
+                        self.auth.clone(),
+                        client.clone(),
+                        local_credential.clone(),
+                    )
+                    .boxed()
                 }
                 #[cfg(not(feature = "sinks-opentelemetry"))]
                 {
