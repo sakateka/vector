@@ -10,18 +10,18 @@ use vector_lib::configurable::configurable_component;
 
 use crate::{
     codecs::EncodingConfigWithFraming,
-    config::{AcknowledgementsConfig, DataType, Input, SinkConfig, SinkContext},
+    config::{AcknowledgementsConfig, DataType, Input, SinkConfig, SinkContext, ValidatedSink},
     http::Auth,
     sinks::{
         Healthcheck, VectorSink,
-        http::config::{HttpMethod, HttpSinkConfig},
+        http::config::{HttpMethod, HttpSinkConfig, ValidatedHttp},
         util::{
             BatchConfig, Compression, RealtimeEventBasedDefaultBatchSettings,
             RealtimeSizeBasedDefaultBatchSettings,
             http::{RequestConfig, RetryStrategy},
         },
     },
-    template::Template,
+    template::{ConfinementConfig, UriTemplate},
     tls::TlsConfig,
 };
 
@@ -104,7 +104,7 @@ pub struct OpenTelemetryConfig {
     #[configurable(metadata(
         docs::warnings = "When using template syntax, the rendered URI is taken from event data. Only use dynamic URIs with trusted event sources to avoid directing Vector to unintended internal network destinations."
     ))]
-    pub uri: Template,
+    pub uri: UriTemplate,
 
     #[configurable(derived)]
     #[configurable(metadata(
@@ -140,6 +140,11 @@ pub struct OpenTelemetryConfig {
         skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
+
+    /// Template confinement settings for outbound URI and metadata values.
+    #[configurable(derived)]
+    #[serde(flatten)]
+    pub confinement: ConfinementConfig,
 }
 
 /// Mirror of `OpenTelemetryConfig` with a plain serde derive, used to decode the new flat format.
@@ -147,7 +152,7 @@ pub struct OpenTelemetryConfig {
 struct FlatOpenTelemetryConfig {
     #[serde(flatten)]
     protocol: OtlpProtocol,
-    uri: Template,
+    uri: UriTemplate,
     #[serde(default)]
     compression: Compression,
     #[serde(default)]
@@ -157,6 +162,8 @@ struct FlatOpenTelemetryConfig {
     tls: Option<TlsConfig>,
     #[serde(default, deserialize_with = "crate::serde::bool_or_struct")]
     acknowledgements: AcknowledgementsConfig,
+    #[serde(flatten)]
+    confinement: ConfinementConfig,
 }
 
 /// Legacy (pre-flattening) nested format: everything under `protocol.*` with `protocol.type`.
@@ -183,6 +190,7 @@ impl From<FlatOpenTelemetryConfig> for OpenTelemetryConfig {
             local_credential: flat.local_credential,
             tls: flat.tls,
             acknowledgements: flat.acknowledgements,
+            confinement: flat.confinement,
         }
     }
 }
@@ -206,6 +214,7 @@ impl From<LegacyOpenTelemetryConfig> for OpenTelemetryConfig {
                 local_credential: http.local_credential,
                 tls: http.tls,
                 acknowledgements: http.acknowledgements,
+                confinement: http.confinement,
             },
         }
     }
@@ -251,12 +260,13 @@ impl<'de> serde::Deserialize<'de> for OpenTelemetryConfig {
 }
 
 impl GenerateConfig for OpenTelemetryConfig {
-    fn generate_config() -> toml::Value {
-        toml::from_str(indoc! {r#"
-            protocol = "http"
-            uri = "http://localhost:5318/v1/logs"
-            encoding.codec = "json"
-        "#})
+    fn generate_config() -> serde_json::Value {
+        serde_yaml::from_str(indoc! {r"
+            protocol: http
+            uri: http://localhost:5318/v1/logs
+            encoding:
+              codec: json
+        "})
         .unwrap()
     }
 }
@@ -264,7 +274,39 @@ impl GenerateConfig for OpenTelemetryConfig {
 #[async_trait::async_trait]
 #[typetag::serde(name = "opentelemetry")]
 impl SinkConfig for OpenTelemetryConfig {
-    async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    fn confinement_config(&self) -> Option<&ConfinementConfig> {
+        Some(&self.confinement)
+    }
+
+    fn input(&self) -> Input {
+        match &self.protocol {
+            OtlpProtocol::Http { encoding, .. } => Input::new(encoding.config().1.input_type()),
+            OtlpProtocol::Grpc { .. } => Input::new(DataType::Log | DataType::Trace),
+        }
+    }
+
+    fn acknowledgements(&self) -> &AcknowledgementsConfig {
+        &self.acknowledgements
+    }
+}
+
+/// Immutable state prepared during OpenTelemetry sink validation.
+#[derive(Clone, Debug)]
+pub struct ValidatedOpenTelemetry {
+    protocol: ValidatedOtlpProtocol,
+}
+
+#[derive(Clone, Debug)]
+enum ValidatedOtlpProtocol {
+    Http { config: HttpSinkConfig, validated: ValidatedHttp },
+    Grpc { config: GrpcSinkConfig, validated: grpc::ValidatedGrpc },
+}
+
+#[async_trait::async_trait]
+impl ValidatedSink for OpenTelemetryConfig {
+    type Validated = ValidatedOpenTelemetry;
+
+    fn validate(&self) -> crate::Result<ValidatedOpenTelemetry> {
         match &self.protocol {
             OtlpProtocol::Http {
                 method,
@@ -289,9 +331,12 @@ impl SinkConfig for OpenTelemetryConfig {
                     tls: self.tls.clone(),
                     acknowledgements: self.acknowledgements,
                     retry_strategy: retry_strategy.clone(),
+                    confinement: self.confinement.clone(),
                 };
-                warn_on_invalid_otlp_batching(&config);
-                config.build(cx).await
+                let validated = config.validate()?;
+                Ok(ValidatedOpenTelemetry {
+                    protocol: ValidatedOtlpProtocol::Http { config, validated },
+                })
             }
             OtlpProtocol::Grpc { batch } => {
                 let grpc_compression = match self.compression {
@@ -311,21 +356,25 @@ impl SinkConfig for OpenTelemetryConfig {
                     local_credential: self.local_credential.clone(),
                     tls: self.tls.clone(),
                     acknowledgements: self.acknowledgements,
+                    confinement: self.confinement.clone(),
                 };
-                config.build(cx).await
+                let validated = config.validate()?;
+                Ok(ValidatedOpenTelemetry {
+                    protocol: ValidatedOtlpProtocol::Grpc { config, validated },
+                })
             }
         }
     }
 
-    fn input(&self) -> Input {
-        match &self.protocol {
-            OtlpProtocol::Http { encoding, .. } => Input::new(encoding.config().1.input_type()),
-            OtlpProtocol::Grpc { .. } => Input::new(DataType::Log | DataType::Trace),
-        }
-    }
 
-    fn acknowledgements(&self) -> &AcknowledgementsConfig {
-        &self.acknowledgements
+    async fn build(&self, validated: &ValidatedOpenTelemetry, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+        match &validated.protocol {
+            ValidatedOtlpProtocol::Http { config, validated } => {
+                warn_on_invalid_otlp_batching(config);
+                Box::pin(config.build_from_validated(validated, cx, Self::NAME)).await
+            }
+            ValidatedOtlpProtocol::Grpc { config, validated } => config.build_from_validated(validated, cx).await,
+        }
     }
 }
 

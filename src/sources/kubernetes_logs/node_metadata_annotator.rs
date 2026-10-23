@@ -2,6 +2,9 @@
 
 #![deny(missing_docs)]
 
+use std::collections::BTreeSet;
+
+use itertools::Either;
 use k8s_openapi::{api::core::v1::Node, apimachinery::pkg::apis::meta::v1::ObjectMeta};
 use kube::runtime::reflector::{ObjectRef, store::Store};
 use vector_lib::{
@@ -29,6 +32,12 @@ pub struct FieldsSpec {
     #[configurable(metadata(docs::examples = "k8s.node_labels"))]
     #[configurable(metadata(docs::examples = ""))]
     pub node_labels: OptionalTargetPath,
+
+    /// Node label keys to include when enriching events.
+    ///
+    /// When unset, all Node labels are included. An empty list includes none.
+    /// Keys are matched exactly, including dots and slashes.
+    pub node_labels_include: Option<BTreeSet<String>>,
 }
 
 impl Default for FieldsSpec {
@@ -36,6 +45,7 @@ impl Default for FieldsSpec {
         Self {
             node_labels: OwnedTargetPath::event(owned_value_path!("kubernetes", "node_labels"))
                 .into(),
+            node_labels_include: None,
         }
     }
 }
@@ -84,6 +94,10 @@ fn annotate_from_metadata(
     if let Some(labels) = &metadata.labels {
         let legacy_key_prefix = fields_spec.node_labels.path.as_ref().map(|k| &k.path);
 
+        let labels = match &fields_spec.node_labels_include {
+            Some(keys) => Either::Left(keys.iter().filter_map(|key| labels.get_key_value(key))),
+            None => Either::Right(labels.iter()),
+        };
         for (key, value) in labels {
             let key_path = path!(key);
             let legacy_key = legacy_key_prefix
@@ -182,6 +196,7 @@ mod tests {
             (
                 FieldsSpec {
                     node_labels: parse_target_path("node_labels").unwrap().into(),
+                    ..FieldsSpec::default()
                 },
                 ObjectMeta {
                     name: Some("sandbox0-name".to_owned()),
@@ -253,6 +268,69 @@ mod tests {
         for (fields_spec, metadata, expected, log_namespace) in cases {
             let mut log = LogEvent::default();
             annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
+            assert_eq!(log, expected);
+        }
+    }
+
+    #[test]
+    fn test_include_node_labels() {
+        let zone = "topology.kubernetes.io/zone";
+        let metadata = ObjectMeta {
+            labels: Some(
+                [
+                    (zone.to_owned(), "mow".to_owned()),
+                    ("kubernetes.io/hostname".to_owned(), "node-1".to_owned()),
+                    (
+                        "cpu-feature.node.kubevirt.io/aes".to_owned(),
+                        "true".to_owned(),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            ..ObjectMeta::default()
+        };
+
+        for log_namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            let fields_spec: FieldsSpec = serde_yaml::from_str(
+                "node_labels: custom.labels\nnode_labels_include: [topology.kubernetes.io/zone, missing]",
+            )
+            .unwrap();
+            let mut log = LogEvent::default();
+            annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
+
+            let mut expected = LogEvent::default();
+            match log_namespace {
+                LogNamespace::Legacy => {
+                    expected.insert(event_path!("custom", "labels", zone), "mow");
+                }
+                LogNamespace::Vector => {
+                    expected.insert(
+                        metadata_path!("kubernetes_logs", "node_labels", zone),
+                        "mow",
+                    );
+                }
+            }
+            assert_eq!(log, expected);
+
+            let fields_spec = FieldsSpec {
+                node_labels_include: Some(BTreeSet::new()),
+                ..FieldsSpec::default()
+            };
+            let mut log = LogEvent::default();
+            annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
+            assert_eq!(log, LogEvent::default());
+
+            let fields_spec = FieldsSpec {
+                node_labels: OptionalTargetPath::none(),
+                node_labels_include: Some([zone.to_owned()].into()),
+            };
+            let mut log = LogEvent::default();
+            annotate_from_metadata(&mut log, &fields_spec, &metadata, log_namespace);
+            let mut expected = LogEvent::default();
+            if log_namespace == LogNamespace::Vector {
+                expected.insert(metadata_path!("kubernetes_logs", "node_labels", zone), "mow");
+            }
             assert_eq!(log, expected);
         }
     }

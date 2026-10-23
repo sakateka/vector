@@ -39,7 +39,7 @@ RUN bash /tmp/install-debian-build-deps.sh \
 COPY scripts/environment/install-protoc.sh /tmp/install-protoc.sh
 RUN bash /tmp/install-protoc.sh
 
-# Rust toolchain pinned by rust-toolchain.toml (currently 1.92).
+# Rust toolchain pinned by rust-toolchain.toml (currently 1.96.1).
 COPY rust-toolchain.toml ./rust-toolchain.toml
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         | sh -s -- -y --default-toolchain none --profile minimal \

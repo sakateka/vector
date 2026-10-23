@@ -17,6 +17,7 @@ use tokio_util::codec::Encoder;
 use tonic::body::BoxBody;
 use tower::{Service, ServiceBuilder};
 use vector_lib::{
+    lookup::event_path,
     ByteSizeOf, EstimatedJsonEncodedSizeOf,
     codecs::encoding::format::OtlpSerializer,
     config::telemetry,
@@ -54,7 +55,7 @@ use crate::{
             StreamSink, http::RequestConfig, metadata::RequestMetadataBuilder, retries::RetryLogic,
         },
     },
-    template::Template,
+    template::{ConfinedTemplate, ConfinedUriTemplate, ConfinementConfig, UriTemplate},
     tls::{MaybeTlsSettings, TlsConfig},
 };
 
@@ -105,7 +106,7 @@ pub(super) struct GrpcSinkConfig {
     #[configurable(metadata(
         docs::warnings = "When using template syntax, the rendered URI is taken from event data. Only use dynamic URIs with trusted event sources to avoid directing Vector to unintended internal network destinations."
     ))]
-    pub uri: Template,
+    pub uri: UriTemplate,
 
     #[configurable(derived)]
     #[serde(default)]
@@ -134,10 +135,54 @@ pub(super) struct GrpcSinkConfig {
         skip_serializing_if = "crate::serde::is_default"
     )]
     pub acknowledgements: AcknowledgementsConfig,
+
+    /// Template confinement settings for outbound URI and metadata values.
+    #[configurable(derived)]
+    #[serde(flatten)]
+    pub confinement: ConfinementConfig,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ValidatedGrpc {
+    uri_template: ConfinedUriTemplate,
+    dynamic_header_templates: Vec<(tonic::metadata::AsciiMetadataKey, ConfinedTemplate)>,
+    static_grpc_headers: Vec<(tonic::metadata::AsciiMetadataKey, tonic::metadata::AsciiMetadataValue)>,
+    batch_settings: BatcherSettings,
 }
 
 impl GrpcSinkConfig {
-    pub(super) async fn build(&self, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
+    pub(super) fn validate(&self) -> crate::Result<ValidatedGrpc> {
+        if self.uri.is_empty() {
+            return Err("gRPC URI must not be empty".into());
+        }
+        if !self.uri.is_dynamic() {
+            with_default_scheme(self.uri.get_ref().parse()?, self.tls.is_some())?;
+        }
+        let uri_template = self.uri.clone().confine(&self.confinement, "opentelemetry", "uri")?;
+        let (static_headers, dynamic_headers) = self.request.split_headers();
+        let mut static_grpc_headers = Vec::with_capacity(static_headers.len());
+        for (name, value) in static_headers {
+            let key = tonic::metadata::AsciiMetadataKey::from_bytes(name.to_lowercase().as_bytes())
+                .map_err(|e| format!("invalid gRPC metadata key {name:?}: {e}"))?;
+            let value = tonic::metadata::AsciiMetadataValue::try_from(value.as_str())
+                .map_err(|e| format!("invalid gRPC metadata value for key {name:?}: {e}"))?;
+            static_grpc_headers.push((key, value));
+        }
+        let mut dynamic_header_templates = Vec::with_capacity(dynamic_headers.len());
+        for (name, template) in dynamic_headers {
+            let key = tonic::metadata::AsciiMetadataKey::from_bytes(name.to_lowercase().as_bytes())
+                .map_err(|e| format!("invalid gRPC metadata key {name:?}: {e}"))?;
+            dynamic_header_templates.push((key, template.confine(&self.confinement, "opentelemetry", "request.headers")?));
+        }
+        Ok(ValidatedGrpc {
+            uri_template,
+            dynamic_header_templates,
+            static_grpc_headers,
+            batch_settings: self.batch.validate()?.into_batcher_settings()?,
+        })
+    }
+
+    pub(super) async fn build_from_validated(&self, validated: &ValidatedGrpc, cx: SinkContext) -> crate::Result<(VectorSink, Healthcheck)> {
         // For static URIs, parse at build time for the healthcheck.
         // Dynamic URIs are rendered per-event during sink execution.
         let static_uri = if self.uri.is_dynamic() {
@@ -161,38 +206,8 @@ impl GrpcSinkConfig {
 
         let compression = self.compression.as_tonic_encoding();
 
-        // Split headers into static (literal values) and dynamic (template values).
-        // Static headers are pre-parsed once and used for the healthcheck and every export.
-        // Dynamic headers are rendered per-event so that templated fields (e.g. tenant IDs)
-        // resolve correctly at export time.
-        let (static_header_strings, dynamic_header_templates_raw) = self.request.split_headers();
-
-        // Static headers are validated at build time and any invalid key or value is a hard
-        // error. Silently dropping them would cause every request to be sent without the
-        // intended metadata (e.g. auth headers), which is worse than failing fast.
-        let mut static_grpc_headers: Vec<(
-            tonic::metadata::AsciiMetadataKey,
-            tonic::metadata::AsciiMetadataValue,
-        )> = Vec::with_capacity(static_header_strings.len());
-        for (k, v) in &static_header_strings {
-            let k_lower = k.to_lowercase();
-            let key = tonic::metadata::AsciiMetadataKey::from_bytes(k_lower.as_bytes())
-                .map_err(|e| format!("invalid gRPC metadata key {k:?}: {e}"))?;
-            let value = tonic::metadata::AsciiMetadataValue::try_from(v.as_str())
-                .map_err(|e| format!("invalid gRPC metadata value for key {k:?}: {e}"))?;
-            static_grpc_headers.push((key, value));
-        }
-
-        // Dynamic header key names are known at build time and validated eagerly.
-        // Values are templated and validated per-event at runtime.
-        let mut dynamic_grpc_header_templates: Vec<(tonic::metadata::AsciiMetadataKey, Template)> =
-            Vec::with_capacity(dynamic_header_templates_raw.len());
-        for (k, t) in dynamic_header_templates_raw {
-            let k_lower = k.to_lowercase();
-            let key = tonic::metadata::AsciiMetadataKey::from_bytes(k_lower.as_bytes())
-                .map_err(|e| format!("invalid gRPC metadata key {k:?}: {e}"))?;
-            dynamic_grpc_header_templates.push((key, t));
-        }
+        let static_grpc_headers = validated.static_grpc_headers.clone();
+        let dynamic_grpc_header_templates = validated.dynamic_header_templates.clone();
 
         let local_credential = self
             .local_credential
@@ -246,7 +261,7 @@ impl GrpcSinkConfig {
             OtlpGrpcService::new(client, compression, static_grpc_headers, local_credential);
 
         let request_settings = self.request.tower.into_settings();
-        let batch_settings = self.batch.into_batcher_settings()?;
+        let batch_settings = validated.batch_settings;
 
         let service = ServiceBuilder::new()
             .settings(request_settings, OtlpGrpcRetryLogic)
@@ -256,7 +271,7 @@ impl GrpcSinkConfig {
             batch_settings,
             service,
             dynamic_header_templates: dynamic_grpc_header_templates,
-            uri_template: self.uri.clone(),
+            uri_template: validated.uri_template.clone(),
             tls_configured,
         };
 
@@ -816,11 +831,11 @@ impl OtlpBatch {
 struct OtlpGrpcSink<S> {
     batch_settings: BatcherSettings,
     service: S,
-    uri_template: Template,
+    uri_template: ConfinedUriTemplate,
     /// Used only to pick the default scheme (`http` vs `https`) when the rendered URI
     /// has no explicit scheme. The connector itself handles both schemes.
     tls_configured: bool,
-    dynamic_header_templates: Vec<(tonic::metadata::AsciiMetadataKey, Template)>,
+    dynamic_header_templates: Vec<(tonic::metadata::AsciiMetadataKey, ConfinedTemplate)>,
 }
 
 impl<S> OtlpGrpcSink<S>
@@ -989,13 +1004,13 @@ fn encode_event(
     // Clone the event to pass ownership to the encoder while keeping the original
     // for metadata extraction in the caller. The clone is shallow for logs/traces.
     match event {
-        Event::Log(log) if log.contains(RESOURCE_LOGS_JSON_FIELD) => {
+        Event::Log(log) if log.contains(event_path!(RESOURCE_LOGS_JSON_FIELD)) => {
             serializer.encode(event.clone(), &mut buf)?;
             Ok(Some(OtlpSignal::Logs(ExportLogsServiceRequest::decode(
                 buf.freeze(),
             )?)))
         }
-        Event::Log(log) if log.contains(RESOURCE_METRICS_JSON_FIELD) => {
+        Event::Log(log) if log.contains(event_path!(RESOURCE_METRICS_JSON_FIELD)) => {
             serializer.encode(event.clone(), &mut buf)?;
             Ok(Some(OtlpSignal::Metrics(
                 ExportMetricsServiceRequest::decode(buf.freeze())?,
@@ -1003,13 +1018,13 @@ fn encode_event(
         }
         // OTLP spans can arrive as Log events when the source does not use
         // use_otlp_decoding.traces = true.
-        Event::Log(log) if log.contains(RESOURCE_SPANS_JSON_FIELD) => {
+        Event::Log(log) if log.contains(event_path!(RESOURCE_SPANS_JSON_FIELD)) => {
             serializer.encode(event.clone(), &mut buf)?;
             Ok(Some(OtlpSignal::Traces(ExportTraceServiceRequest::decode(
                 buf.freeze(),
             )?)))
         }
-        Event::Trace(trace) if trace.contains(RESOURCE_SPANS_JSON_FIELD) => {
+        Event::Trace(trace) if trace.contains(event_path!(RESOURCE_SPANS_JSON_FIELD)) => {
             serializer.encode(event.clone(), &mut buf)?;
             Ok(Some(OtlpSignal::Traces(ExportTraceServiceRequest::decode(
                 buf.freeze(),
@@ -1138,4 +1153,31 @@ mod tests {
         let uri = with_default_scheme("http://localhost:4317".parse().unwrap(), true).unwrap();
         assert_eq!(uri.scheme_str(), Some("http"));
     }
+    #[test]
+    fn validation_rejects_unconfined_grpc_uri() {
+        let config: GrpcSinkConfig = toml::from_str(r#"uri = "http://{{ host }}:4317""#).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validation_rejects_unconfined_grpc_header() {
+        let config: GrpcSinkConfig = toml::from_str(r#"
+            uri = "http://localhost:4317"
+            [request.headers]
+            x-tenant = "{{ tenant }}"
+        "#).unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn validation_confines_grpc_uri_at_render_time() {
+        let config: GrpcSinkConfig = toml::from_str(r#"uri = "http://localhost:4317/logs/{{ path }}""#).unwrap();
+        let validated = config.validate().unwrap();
+        let mut event = crate::event::LogEvent::default();
+        event.insert(event_path!("path"), "tenant-a");
+        assert_eq!(validated.uri_template.render_string(&event).unwrap(), "http://localhost:4317/logs/tenant-a");
+        event.insert(event_path!("path"), "../../admin");
+        assert!(validated.uri_template.render_string(&event).is_err());
+    }
+
 }
