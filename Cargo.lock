@@ -3055,6 +3055,7 @@ dependencies = [
  "itoa",
  "rustversion",
  "ryu",
+ "serde",
  "static_assertions",
 ]
 
@@ -14121,7 +14122,7 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 [[package]]
 name = "vrl"
 version = "0.37.0"
-source = "git+https://github.com/sakateka/vrl.git?rev=50be0333b4514c0439fa92bb8a65fe7a3ba3a0b9#50be0333b4514c0439fa92bb8a65fe7a3ba3a0b9"
+source = "git+https://github.com/sakateka/vrl.git?rev=440e92c4ef963f8628b7a8c6f82c49e22d09f062#440e92c4ef963f8628b7a8c6f82c49e22d09f062"
 dependencies = [
  "aes 0.9.1",
  "aes-siv",
@@ -14144,6 +14145,7 @@ dependencies = [
  "clap",
  "codespan-reporting",
  "community-id",
+ "compact_str",
  "convert_case 0.12.0",
  "crc",
  "crypto_secretbox",
