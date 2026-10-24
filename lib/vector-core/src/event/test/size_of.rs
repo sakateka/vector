@@ -87,7 +87,7 @@ pub(crate) enum Action {
 
 impl Arbitrary for Action {
     fn arbitrary(g: &mut Gen) -> Self {
-        match u8::arbitrary(g) % 3 {
+        match u8::arbitrary(g) % 4 {
             0 => Action::InsertFlat {
                 key: String::from(Name::arbitrary(g)).into(),
                 value: Value::arbitrary(g),
@@ -106,39 +106,41 @@ impl Arbitrary for Action {
 
 #[test]
 fn log_operation_maintains_size() {
-    // Asserts that the stated size of a LogEvent only changes by the amount
-    // that we insert / remove from it and that read-only operations do not
-    // change the size.
-    fn inner(actions: Vec<Action>, mut log_event: LogEvent) -> TestResult {
-        let mut current_size = log_event.size_of();
+    // Compare the cached LogEvent charge with a separately mutated Value. Tree
+    // splits, retained roots, and spare capacity may change the charge on writes.
+    fn inner(actions: Vec<Action>, initial: LogEvent) -> TestResult {
+        let value = initial.value().clone();
+        let mut expected = value.clone();
+        let mut log_event = LogEvent::from(value.clone());
+        let wrapper_bytes = log_event.size_of() - expected.allocated_bytes();
 
         for action in actions {
             match action {
                 Action::InsertFlat { key, value } => {
-                    let new_value_sz = value.size_of();
-                    let target_path = (PathPrefix::Event, path!(key.as_str()));
-                    let old_value_sz = log_event.get(target_path).map_or(0, ByteSizeOf::size_of);
-                    if !log_event.contains((PathPrefix::Event, path!(key.as_str()))) {
-                        current_size += key.size_of();
-                    }
-                    log_event.insert(target_path, value);
-                    current_size -= old_value_sz;
-                    current_size += new_value_sz;
+                    expected.insert(path!(key.as_str()), value.clone());
+                    log_event.insert((PathPrefix::Event, path!(key.as_str())), value.clone());
                 }
                 Action::SizeOf => {
-                    assert_eq!(current_size, log_event.size_of());
+                    assert_eq!(
+                        wrapper_bytes + expected.allocated_bytes(),
+                        log_event.size_of()
+                    );
                 }
                 Action::Contains { key } => {
-                    log_event.contains((PathPrefix::Event, path!(key.as_str())));
+                    assert_eq!(
+                        expected.get(path!(key.as_str())).is_some(),
+                        log_event.contains((PathPrefix::Event, path!(key.as_str())))
+                    );
                 }
                 Action::Remove { key } => {
-                    let value_sz = log_event
-                        .remove((PathPrefix::Event, path!(key.as_str())))
-                        .size_of();
-                    current_size -= value_sz;
-                    current_size -= key.size_of();
+                    expected.remove(path!(key.as_str()), false);
+                    log_event.remove((PathPrefix::Event, path!(key.as_str())));
                 }
             }
+            assert_eq!(
+                wrapper_bytes + expected.allocated_bytes(),
+                log_event.size_of()
+            );
         }
 
         TestResult::passed()

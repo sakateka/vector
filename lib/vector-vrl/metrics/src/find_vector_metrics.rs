@@ -32,7 +32,8 @@ fn find_metrics(
     ))
 }
 
-static DEFAULT_TAGS: LazyLock<Value> = LazyLock::new(|| Value::Object(BTreeMap::new()));
+static DEFAULT_TAGS: LazyLock<Value> =
+    LazyLock::new(|| Value::Object(vrl::value::ObjectMap::new()));
 
 static PARAMETERS: LazyLock<Vec<Parameter>> = LazyLock::new(|| {
     vec![

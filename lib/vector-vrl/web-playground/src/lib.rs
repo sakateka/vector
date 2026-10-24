@@ -1,5 +1,3 @@
-use std::collections::BTreeMap;
-
 use gloo_utils::format::JsValueSerdeExt;
 use serde::{Deserialize, Serialize};
 use vrl::{
@@ -121,7 +119,7 @@ fn compile(
 
     let mut target_value = TargetValue {
         value: event.clone(),
-        metadata: Value::Object(BTreeMap::new()),
+        metadata: Value::Object(vrl::value::ObjectMap::new()),
         secrets: Secrets::new(),
     };
 

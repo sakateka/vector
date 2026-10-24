@@ -138,6 +138,12 @@ impl From<TraceEvent> for LogEvent {
     }
 }
 
+impl From<std::collections::BTreeMap<vrl::value::KeyString, Value>> for TraceEvent {
+    fn from(map: std::collections::BTreeMap<vrl::value::KeyString, Value>) -> Self {
+        Self::from(ObjectMap::from(map))
+    }
+}
+
 impl From<ObjectMap> for TraceEvent {
     fn from(map: ObjectMap) -> Self {
         Self(map.into())

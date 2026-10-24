@@ -673,6 +673,12 @@ impl From<Value> for LogEvent {
     }
 }
 
+impl From<std::collections::BTreeMap<KeyString, Value>> for LogEvent {
+    fn from(map: std::collections::BTreeMap<KeyString, Value>) -> Self {
+        Self::from(ObjectMap::from(map))
+    }
+}
+
 impl From<ObjectMap> for LogEvent {
     fn from(map: ObjectMap) -> Self {
         Self::from_parts(Value::Object(map), EventMetadata::default())

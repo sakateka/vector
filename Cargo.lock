@@ -138,6 +138,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "allocator-api2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
+
+[[package]]
 name = "amq-protocol"
 version = "10.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -380,6 +386,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
+]
+
+[[package]]
+name = "arena-btreemap"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "58eed693eb0b42c7631f70044924736fbf77c6698bc843b8c20b3136826ed42c"
+dependencies = [
+ "allocator-api2 0.4.0",
 ]
 
 [[package]]
@@ -5246,7 +5261,7 @@ version = "0.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf151400ff0baff5465007dd2f3e717f3fe502074ca563069ce3a6629d07b289"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "equivalent",
  "foldhash 0.1.3",
 ]
@@ -5257,7 +5272,7 @@ version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5419bdc4f6a9207fbeba6d11b604d481addf78ecd10c11ad51e76c2f6482748d"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "equivalent",
  "foldhash 0.2.0",
 ]
@@ -5268,7 +5283,7 @@ version = "0.17.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "equivalent",
  "foldhash 0.2.0",
 ]
@@ -14106,12 +14121,12 @@ checksum = "49874b5167b65d7193b8aba1567f5c7d93d001cafc34600cee003eda787e483f"
 [[package]]
 name = "vrl"
 version = "0.37.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a862151998a9dba2ef69c72d5d86a1bb4a22890b9b2f9f7109a142d7b9946aff"
+source = "git+https://github.com/sakateka/vrl.git?rev=50be0333b4514c0439fa92bb8a65fe7a3ba3a0b9#50be0333b4514c0439fa92bb8a65fe7a3ba3a0b9"
 dependencies = [
  "aes 0.9.1",
  "aes-siv",
  "arbitrary",
+ "arena-btreemap",
  "base16",
  "base62",
  "base64-simd",

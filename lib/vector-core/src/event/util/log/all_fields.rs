@@ -1,8 +1,8 @@
-use std::{collections::btree_map, fmt::Write as _, iter, slice, sync::LazyLock};
+use std::{fmt::Write as _, iter, slice, sync::LazyLock};
 
 use regex::Regex;
 use serde::{Serialize, Serializer};
-use vrl::path::PathPrefix;
+use vrl::{path::PathPrefix, value::object_map};
 
 use crate::event::{KeyString, ObjectMap, Value};
 
@@ -41,7 +41,7 @@ pub fn all_fields_skip_array_elements(fields: &ObjectMap) -> FieldsIter<'_> {
 #[derive(Clone, Debug)]
 enum LeafIter<'a> {
     Root((&'a Value, bool)),
-    Map(btree_map::Iter<'a, KeyString, Value>),
+    Map(object_map::Iter<'a>),
     Array(iter::Enumerate<slice::Iter<'a, Value>>),
 }
 
