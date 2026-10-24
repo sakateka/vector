@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use bytes::BytesMut;
+use bytes::{BufMut, Bytes, BytesMut};
 use futures::{StreamExt, TryFutureExt, future::BoxFuture, stream::BoxStream};
 use http::Uri;
 use hyper::client::HttpConnector;
@@ -26,11 +26,9 @@ use vector_lib::{
     opentelemetry::proto::{
         RESOURCE_LOGS_JSON_FIELD, RESOURCE_METRICS_JSON_FIELD, RESOURCE_SPANS_JSON_FIELD,
         collector::{
-            logs::v1::{ExportLogsServiceRequest, logs_service_client::LogsServiceClient},
-            metrics::v1::{
-                ExportMetricsServiceRequest, metrics_service_client::MetricsServiceClient,
-            },
-            trace::v1::{ExportTraceServiceRequest, trace_service_client::TraceServiceClient},
+            logs::v1::{ExportLogsServiceRequest, ExportLogsServiceResponse},
+            metrics::v1::ExportMetricsServiceResponse,
+            trace::v1::ExportTraceServiceResponse,
         },
     },
     partition::Partitioner,
@@ -395,6 +393,44 @@ enum OtlpGrpcError {
 
 // ── Request/Response ─────────────────────────────────────────────────────────
 
+/// Sends an already encoded request while retaining tonic's normal response decoding.
+#[derive(Default)]
+struct EncodedOtlpCodec<T> {
+    responses: tonic::codec::ProstCodec<ExportLogsServiceRequest, T>,
+}
+
+struct EncodedOtlpEncoder;
+
+impl tonic::codec::Encoder for EncodedOtlpEncoder {
+    type Item = Bytes;
+    type Error = tonic::Status;
+
+    fn encode(
+        &mut self,
+        item: Bytes,
+        dst: &mut tonic::codec::EncodeBuf<'_>,
+    ) -> Result<(), Self::Error> {
+        dst.put_slice(&item);
+        Ok(())
+    }
+}
+
+impl<T: Message + Default + Send + 'static> tonic::codec::Codec for EncodedOtlpCodec<T> {
+    type Encode = Bytes;
+    type Decode = T;
+    type Encoder = EncodedOtlpEncoder;
+    type Decoder =
+        <tonic::codec::ProstCodec<ExportLogsServiceRequest, T> as tonic::codec::Codec>::Decoder;
+
+    fn encoder(&mut self) -> Self::Encoder {
+        EncodedOtlpEncoder
+    }
+
+    fn decoder(&mut self) -> Self::Decoder {
+        tonic::codec::Codec::decoder(&mut self.responses)
+    }
+}
+
 /// A single-signal OTLP export request. One request per signal type ensures
 /// that retries are atomic: a failed metrics export cannot duplicate a
 /// previously-accepted logs export.
@@ -455,18 +491,7 @@ impl DriverResponse for OtlpGrpcResponse {
 #[derive(Clone)]
 struct CachedClients {
     uri: Uri,
-    logs: LogsServiceClient<HyperSvc>,
-    metrics: MetricsServiceClient<HyperSvc>,
-    traces: TraceServiceClient<HyperSvc>,
-}
-
-/// Holds whichever tonic client is needed for a single `OtlpGrpcRequest`. Only the
-/// relevant client is cloned out of `CachedClients`, avoiding two unnecessary clones
-/// per `Service::call` invocation.
-enum SignalClient {
-    Logs(LogsServiceClient<HyperSvc>),
-    Metrics(MetricsServiceClient<HyperSvc>),
-    Traces(TraceServiceClient<HyperSvc>),
+    client: tonic::client::Grpc<HyperSvc>,
 }
 
 #[derive(Clone)]
@@ -504,32 +529,24 @@ impl OtlpGrpcService {
         }
     }
 
-    /// Rebuilds cached tonic clients if the URI changed, then returns the single client
-    /// matching `signal`. Only that one client is cloned.
-    fn client_for_signal(&mut self, uri: &Uri, signal: &OtlpSignal) -> SignalClient {
+    /// Rebuilds the cached tonic client if the rendered URI changed.
+    fn client(&mut self, uri: &Uri) -> tonic::client::Grpc<HyperSvc> {
         if self.clients.as_ref().is_none_or(|c| &c.uri != uri) {
             let svc = HyperSvc::new(uri.clone(), self.hyper_client.clone());
-            let mut logs = LogsServiceClient::new(svc.clone());
-            let mut metrics = MetricsServiceClient::new(svc.clone());
-            let mut traces = TraceServiceClient::new(svc);
+            let mut client = tonic::client::Grpc::new(svc);
             if let Some(enc) = self.compression {
-                logs = logs.send_compressed(enc).accept_compressed(enc);
-                metrics = metrics.send_compressed(enc).accept_compressed(enc);
-                traces = traces.send_compressed(enc).accept_compressed(enc);
+                client = client.send_compressed(enc).accept_compressed(enc);
             }
             self.clients = Some(CachedClients {
                 uri: uri.clone(),
-                logs,
-                metrics,
-                traces,
+                client,
             });
         }
-        let c = self.clients.as_ref().expect("just populated");
-        match signal {
-            OtlpSignal::Logs(_) => SignalClient::Logs(c.logs.clone()),
-            OtlpSignal::Metrics(_) => SignalClient::Metrics(c.metrics.clone()),
-            OtlpSignal::Traces(_) => SignalClient::Traces(c.traces.clone()),
-        }
+        self.clients
+            .as_ref()
+            .expect("just populated")
+            .client
+            .clone()
     }
 }
 
@@ -544,8 +561,7 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
 
     fn call(&mut self, mut req: OtlpGrpcRequest) -> Self::Future {
         let (protocol, endpoint) = crate::sinks::util::uri::protocol_endpoint(req.uri.clone());
-        // Rebuild clients if the URI changed; clone only the client for this signal type.
-        let client = self.client_for_signal(&req.uri, &req.signal);
+        let mut client = self.client(&req.uri);
         let static_headers = std::sync::Arc::clone(&self.headers);
         let local_credential = self.local_credential.clone();
         let metadata = std::mem::take(req.metadata_mut());
@@ -563,8 +579,8 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
             };
 
             macro_rules! export {
-                ($client:expr, $payload:expr) => {{
-                    let len = $payload.encoded_len();
+                ($payload:expr, $response:ty, $service:literal) => {{
+                    let len = $payload.len();
                     let mut grpc_req = tonic::Request::new($payload);
                     for (key, value) in static_headers.iter() {
                         grpc_req.metadata_mut().insert(key.clone(), value.clone());
@@ -575,19 +591,36 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
                     if let Some((key, value)) = &credential_header {
                         grpc_req.metadata_mut().insert(key.clone(), value.clone());
                     }
-                    let response = $client
-                        .export(grpc_req)
+                    grpc_req
+                        .extensions_mut()
+                        .insert(tonic::GrpcMethod::new($service, "Export"));
+                    client
+                        .ready()
+                        .await
+                        .map_err(|error| OtlpGrpcError::Request {
+                            source: tonic::Status::unknown(format!(
+                                "Service was not ready: {error}"
+                            )),
+                        })?;
+                    let response = client
+                        .unary(
+                            grpc_req,
+                            http::uri::PathAndQuery::from_static(concat!("/", $service, "/Export")),
+                            EncodedOtlpCodec::<$response>::default(),
+                        )
                         .map_err(|source| OtlpGrpcError::Request { source })
                         .await?;
                     (len, response.into_inner())
                 }};
             }
 
-            // The signal variant and the client type are always aligned — both are derived
-            // from `req.signal` in `client_for_signal` — so the mixed arms are unreachable.
-            let (byte_size, had_partial_success) = match (req.signal, client) {
-                (OtlpSignal::Logs(r), SignalClient::Logs(mut c)) => {
-                    let (len, resp) = export!(c, r);
+            let (byte_size, had_partial_success) = match req.signal {
+                OtlpSignal::Logs(r) => {
+                    let (len, resp) = export!(
+                        r,
+                        ExportLogsServiceResponse,
+                        "opentelemetry.proto.collector.logs.v1.LogsService"
+                    );
                     let partial = if let Some(ps) = resp.partial_success
                         && ps.rejected_log_records > 0
                     {
@@ -610,8 +643,12 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
                     };
                     (len, partial)
                 }
-                (OtlpSignal::Metrics(r), SignalClient::Metrics(mut c)) => {
-                    let (len, resp) = export!(c, r);
+                OtlpSignal::Metrics(r) => {
+                    let (len, resp) = export!(
+                        r,
+                        ExportMetricsServiceResponse,
+                        "opentelemetry.proto.collector.metrics.v1.MetricsService"
+                    );
                     let partial = if let Some(ps) = resp.partial_success
                         && ps.rejected_data_points > 0
                     {
@@ -634,8 +671,12 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
                     };
                     (len, partial)
                 }
-                (OtlpSignal::Traces(r), SignalClient::Traces(mut c)) => {
-                    let (len, resp) = export!(c, r);
+                OtlpSignal::Traces(r) => {
+                    let (len, resp) = export!(
+                        r,
+                        ExportTraceServiceResponse,
+                        "opentelemetry.proto.collector.trace.v1.TraceService"
+                    );
                     let partial = if let Some(ps) = resp.partial_success
                         && ps.rejected_spans > 0
                     {
@@ -658,7 +699,6 @@ impl Service<OtlpGrpcRequest> for OtlpGrpcService {
                     };
                     (len, partial)
                 }
-                _ => unreachable!("signal variant and cached client are always aligned"),
             };
 
             emit!(EndpointBytesSent {
@@ -740,30 +780,32 @@ impl ByteSizeOf for OtlpEventData {
 /// type so that requests can be retried independently.
 #[derive(Clone)]
 enum OtlpSignal {
-    Logs(ExportLogsServiceRequest),
-    Metrics(ExportMetricsServiceRequest),
-    Traces(ExportTraceServiceRequest),
+    Logs(Bytes),
+    Metrics(Bytes),
+    Traces(Bytes),
 }
 
 /// Per-signal accumulator tracking the merged proto request and its associated
 /// event metadata. Kept separate so each signal can be retried independently.
-struct SignalData<R> {
-    request: R,
+struct SignalData {
+    request: BytesMut,
     finalizers: EventFinalizers,
     event_count: usize,
     byte_size: usize,
     json_byte_size: GroupedCountByteSize,
 }
 
-impl<R> SignalData<R> {
-    const fn new(
-        request: R,
+impl SignalData {
+    fn new(
+        request: Bytes,
         finalizers: EventFinalizers,
         byte_size: usize,
         json_byte_size: GroupedCountByteSize,
     ) -> Self {
         SignalData {
-            request,
+            request: request
+                .try_into_mut()
+                .unwrap_or_else(|request| BytesMut::from(request.as_ref())),
             finalizers,
             event_count: 1,
             byte_size,
@@ -773,13 +815,15 @@ impl<R> SignalData<R> {
 
     fn merge(
         &mut self,
-        req: R,
+        req: &[u8],
         finalizers: EventFinalizers,
         byte_size: usize,
         json_byte_size: GroupedCountByteSize,
-        merge_req: impl FnOnce(&mut R, R),
     ) {
-        merge_req(&mut self.request, req);
+        // Each OTLP Export request consists solely of a repeated resource field.
+        // Concatenating their protobuf encodings appends those resources in order:
+        // https://protobuf.dev/programming-guides/encoding/#last-one-wins
+        self.request.extend_from_slice(req);
         self.finalizers.merge(finalizers);
         self.event_count += 1;
         self.byte_size += byte_size;
@@ -791,9 +835,9 @@ impl<R> SignalData<R> {
 /// the resulting requests can be retried independently.
 #[derive(Default)]
 struct OtlpBatch {
-    logs: Option<SignalData<ExportLogsServiceRequest>>,
-    metrics: Option<SignalData<ExportMetricsServiceRequest>>,
-    traces: Option<SignalData<ExportTraceServiceRequest>>,
+    logs: Option<SignalData>,
+    metrics: Option<SignalData>,
+    traces: Option<SignalData>,
 }
 
 impl OtlpBatch {
@@ -806,31 +850,21 @@ impl OtlpBatch {
             uri: _,
             dynamic_headers: _,
         } = item;
-        match signal {
-            OtlpSignal::Logs(req) => match &mut self.logs {
-                Some(existing) => {
-                    existing.merge(req, finalizers, byte_size, json_byte_size, |e, r| {
-                        e.resource_logs.extend(r.resource_logs)
-                    })
-                }
-                slot => *slot = Some(SignalData::new(req, finalizers, byte_size, json_byte_size)),
-            },
-            OtlpSignal::Metrics(req) => match &mut self.metrics {
-                Some(existing) => {
-                    existing.merge(req, finalizers, byte_size, json_byte_size, |e, r| {
-                        e.resource_metrics.extend(r.resource_metrics)
-                    })
-                }
-                slot => *slot = Some(SignalData::new(req, finalizers, byte_size, json_byte_size)),
-            },
-            OtlpSignal::Traces(req) => match &mut self.traces {
-                Some(existing) => {
-                    existing.merge(req, finalizers, byte_size, json_byte_size, |e, r| {
-                        e.resource_spans.extend(r.resource_spans)
-                    })
-                }
-                slot => *slot = Some(SignalData::new(req, finalizers, byte_size, json_byte_size)),
-            },
+        let (slot, request) = match signal {
+            OtlpSignal::Logs(request) => (&mut self.logs, request),
+            OtlpSignal::Metrics(request) => (&mut self.metrics, request),
+            OtlpSignal::Traces(request) => (&mut self.traces, request),
+        };
+        match slot {
+            Some(existing) => existing.merge(&request, finalizers, byte_size, json_byte_size),
+            slot => {
+                *slot = Some(SignalData::new(
+                    request,
+                    finalizers,
+                    byte_size,
+                    json_byte_size,
+                ));
+            }
         }
     }
 }
@@ -903,9 +937,6 @@ where
                     }
                 }
 
-                // TODO(perf): OtlpSerializer only exposes a byte-level Encoder interface, so
-                // encode_event must encode to bytes and then decode back to a typed proto struct.
-                // Exposing a typed output from OtlpSerializer would eliminate this roundtrip.
                 let mut json_byte_size = telemetry().create_request_count_byte_size();
                 json_byte_size.add_event(&event, event.estimated_json_encoded_size_of());
                 let byte_size = event.size_of();
@@ -1001,7 +1032,7 @@ where
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Encode a Vector event into an OTLP proto signal using [`OtlpSerializer`].
+/// Encode a Vector event into an OTLP wire payload using [`OtlpSerializer`].
 ///
 /// Returns `Ok(None)` for native Vector `Metric` events (not supported by OTLP
 /// serializer). Returns `Err` for unexpected encoding failures.
@@ -1014,29 +1045,21 @@ fn encode_event(
     match &event {
         Event::Log(log) if log.contains(event_path!(RESOURCE_LOGS_JSON_FIELD)) => {
             serializer.encode(event, &mut buf)?;
-            Ok(Some(OtlpSignal::Logs(ExportLogsServiceRequest::decode(
-                buf.freeze(),
-            )?)))
+            Ok(Some(OtlpSignal::Logs(buf.freeze())))
         }
         Event::Log(log) if log.contains(event_path!(RESOURCE_METRICS_JSON_FIELD)) => {
             serializer.encode(event, &mut buf)?;
-            Ok(Some(OtlpSignal::Metrics(
-                ExportMetricsServiceRequest::decode(buf.freeze())?,
-            )))
+            Ok(Some(OtlpSignal::Metrics(buf.freeze())))
         }
         // OTLP spans can arrive as Log events when the source does not use
         // use_otlp_decoding.traces = true.
         Event::Log(log) if log.contains(event_path!(RESOURCE_SPANS_JSON_FIELD)) => {
             serializer.encode(event, &mut buf)?;
-            Ok(Some(OtlpSignal::Traces(ExportTraceServiceRequest::decode(
-                buf.freeze(),
-            )?)))
+            Ok(Some(OtlpSignal::Traces(buf.freeze())))
         }
         Event::Trace(trace) if trace.contains(event_path!(RESOURCE_SPANS_JSON_FIELD)) => {
             serializer.encode(event, &mut buf)?;
-            Ok(Some(OtlpSignal::Traces(ExportTraceServiceRequest::decode(
-                buf.freeze(),
-            )?)))
+            Ok(Some(OtlpSignal::Traces(buf.freeze())))
         }
         _ => Ok(None),
     }
@@ -1064,21 +1087,21 @@ fn reject_event(
 }
 
 /// Build an [`OtlpGrpcRequest`] from a per-signal accumulator.
-fn signal_into_request<R: prost::Message>(
-    data: SignalData<R>,
-    make_signal: fn(R) -> OtlpSignal,
+fn signal_into_request(
+    data: SignalData,
+    make_signal: fn(Bytes) -> OtlpSignal,
     uri: &Uri,
     dynamic_headers: Vec<(
         tonic::metadata::AsciiMetadataKey,
         tonic::metadata::AsciiMetadataValue,
     )>,
 ) -> OtlpGrpcRequest {
-    let byte_size = data.request.encoded_len();
+    let byte_size = data.request.len();
     let bytes_len = NonZeroUsize::new(byte_size.max(1)).expect("should be non-zero");
     let builder =
         RequestMetadataBuilder::new(data.event_count, data.byte_size, data.json_byte_size);
     OtlpGrpcRequest {
-        signal: make_signal(data.request),
+        signal: make_signal(data.request.freeze()),
         uri: uri.clone(),
         dynamic_headers,
         finalizers: data.finalizers,
@@ -1091,6 +1114,238 @@ mod tests {
     use super::*;
     use crate::event::{BatchNotifier, BatchStatus, LogEvent, TraceEvent};
     use crate::sinks::util::grpc::with_default_scheme;
+    use vector_lib::opentelemetry::proto::collector::{
+        logs::v1::logs_service_server::{LogsService, LogsServiceServer},
+        metrics::v1::{
+            ExportMetricsServiceRequest,
+            metrics_service_server::{MetricsService, MetricsServiceServer},
+        },
+        trace::v1::{
+            ExportTraceServiceRequest,
+            trace_service_server::{TraceService, TraceServiceServer},
+        },
+    };
+    use vector_lib::opentelemetry::proto::{
+        DESCRIPTOR_BYTES, LOGS_REQUEST_MESSAGE_TYPE, METRICS_REQUEST_MESSAGE_TYPE,
+        TRACES_REQUEST_MESSAGE_TYPE,
+    };
+
+    #[test]
+    fn wire_batches_match_typed_batches() {
+        macro_rules! check {
+            ($request:ty, $resources:ident) => {{
+                let mut first = <$request>::default();
+                first.$resources.push(Default::default());
+                first.$resources[0].schema_url = "first".into();
+                let mut second = <$request>::default();
+                second.$resources.resize_with(2, Default::default);
+                second.$resources[0].schema_url = "second".into();
+                let mut batch = SignalData::new(
+                    first.encode_to_vec().into(),
+                    EventFinalizers::default(),
+                    10,
+                    GroupedCountByteSize::default(),
+                );
+                batch.merge(
+                    &second.encode_to_vec(),
+                    EventFinalizers::default(),
+                    20,
+                    GroupedCountByteSize::default(),
+                );
+                first.$resources.extend(second.$resources);
+                assert_eq!(batch.request.as_ref(), first.encode_to_vec());
+                assert_eq!(batch.event_count, 2);
+                assert_eq!(batch.byte_size, 30);
+            }};
+        }
+        check!(ExportLogsServiceRequest, resource_logs);
+        check!(ExportMetricsServiceRequest, resource_metrics);
+        check!(ExportTraceServiceRequest, resource_spans);
+
+        for name in [
+            LOGS_REQUEST_MESSAGE_TYPE,
+            METRICS_REQUEST_MESSAGE_TYPE,
+            TRACES_REQUEST_MESSAGE_TYPE,
+        ] {
+            let descriptor = vrl::protobuf::descriptor::get_message_descriptor_from_bytes(
+                DESCRIPTOR_BYTES,
+                name,
+            )
+            .unwrap();
+            let fields: Vec<_> = descriptor.fields().collect();
+            assert_eq!(
+                fields.len(),
+                1,
+                "wire batching requires a single repeated resource field: {name}"
+            );
+            assert!(fields[0].is_list());
+        }
+    }
+
+    struct Collector {
+        partial: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    macro_rules! collector {
+        ($service:ident, $request:ty, $response:ty, $resources:ident, $rejected:ident) => {
+            #[async_trait]
+            impl $service for Collector {
+                async fn export(
+                    &self,
+                    request: tonic::Request<$request>,
+                ) -> Result<tonic::Response<$response>, tonic::Status> {
+                    assert_eq!(request.metadata().get("x-static").unwrap(), "static");
+                    assert_eq!(request.metadata().get("x-tenant").unwrap(), "tenant");
+                    assert_eq!(request.get_ref().$resources.len(), 2);
+                    assert_eq!(request.get_ref().$resources[0].schema_url, "first");
+                    let mut response = <$response>::default();
+                    if self.partial.load(std::sync::atomic::Ordering::Relaxed) {
+                        let mut partial = response.partial_success.take().unwrap_or_default();
+                        partial.$rejected = 1;
+                        response.partial_success = Some(partial);
+                    }
+                    Ok(tonic::Response::new(response))
+                }
+            }
+        };
+    }
+    collector!(
+        LogsService,
+        ExportLogsServiceRequest,
+        ExportLogsServiceResponse,
+        resource_logs,
+        rejected_log_records
+    );
+    collector!(
+        MetricsService,
+        ExportMetricsServiceRequest,
+        ExportMetricsServiceResponse,
+        resource_metrics,
+        rejected_data_points
+    );
+    collector!(
+        TraceService,
+        ExportTraceServiceRequest,
+        ExportTraceServiceResponse,
+        resource_spans,
+        rejected_spans
+    );
+
+    macro_rules! payload {
+        ($request:ty, $resources:ident) => {{
+            let mut request = <$request>::default();
+            request.$resources.resize_with(2, Default::default);
+            request.$resources[0].schema_url = "first".into();
+            Bytes::from(request.encode_to_vec())
+        }};
+    }
+
+    #[tokio::test]
+    async fn encoded_transport_preserves_signals_compression_headers_and_partial_success() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        use tonic::codec::CompressionEncoding::{Gzip, Zstd};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let uri: Uri = format!("http://{}", listener.local_addr().unwrap())
+            .parse()
+            .unwrap();
+        let partial = Arc::new(AtomicBool::new(false));
+        macro_rules! collector_server {
+            ($server:ident) => {
+                $server::new(Collector {
+                    partial: Arc::clone(&partial),
+                })
+                .accept_compressed(Gzip)
+                .accept_compressed(Zstd)
+                .send_compressed(Gzip)
+                .send_compressed(Zstd)
+            };
+        }
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(collector_server!(LogsServiceServer))
+                .add_service(collector_server!(MetricsServiceServer))
+                .add_service(collector_server!(TraceServiceServer))
+                .serve_with_incoming_shutdown(
+                    tokio_stream::wrappers::TcpListenerStream::new(listener),
+                    async {
+                        stopped.await.expect("test sends shutdown");
+                    },
+                ),
+        );
+
+        let signals: [(fn(Bytes) -> OtlpSignal, Bytes); 3] = [
+            (
+                OtlpSignal::Logs,
+                payload!(ExportLogsServiceRequest, resource_logs),
+            ),
+            (
+                OtlpSignal::Metrics,
+                payload!(ExportMetricsServiceRequest, resource_metrics),
+            ),
+            (
+                OtlpSignal::Traces,
+                payload!(ExportTraceServiceRequest, resource_spans),
+            ),
+        ];
+        for compression in [None, Some(Gzip), Some(Zstd)] {
+            let tls = MaybeTlsSettings::tls_client(None).unwrap();
+            let client = new_grpc_client(&tls, &crate::config::ProxyConfig::default()).unwrap();
+            let mut service = OtlpGrpcService::new(
+                client,
+                compression,
+                vec![("x-static".parse().unwrap(), "static".parse().unwrap())],
+                None,
+            );
+            for reject in [false, true] {
+                partial.store(reject, Ordering::Relaxed);
+                for (make_signal, bytes) in &signals {
+                    let data = SignalData::new(
+                        bytes.clone(),
+                        EventFinalizers::default(),
+                        100,
+                        GroupedCountByteSize::default(),
+                    );
+                    let request = signal_into_request(
+                        data,
+                        *make_signal,
+                        &uri,
+                        vec![("x-tenant".parse().unwrap(), "tenant".parse().unwrap())],
+                    );
+                    // Tower retries clone requests; encoded payloads share their immutable bytes.
+                    let cloned = request.clone();
+                    let (OtlpSignal::Logs(original)
+                    | OtlpSignal::Metrics(original)
+                    | OtlpSignal::Traces(original)) = &request.signal;
+                    let (OtlpSignal::Logs(copy)
+                    | OtlpSignal::Metrics(copy)
+                    | OtlpSignal::Traces(copy)) = &cloned.signal;
+                    assert_eq!(original.as_ptr(), copy.as_ptr());
+                    let response = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        service.call(request),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert_eq!(
+                        response.event_status(),
+                        if reject {
+                            EventStatus::Rejected
+                        } else {
+                            EventStatus::Delivered
+                        }
+                    );
+                }
+            }
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap().unwrap();
+    }
 
     #[test]
     fn encode_owned_otlp_signals() {
@@ -1106,6 +1361,7 @@ mod tests {
         else {
             panic!("expected logs signal");
         };
+        let request = ExportLogsServiceRequest::decode(request).unwrap();
         let record = &request.resource_logs[0].scope_logs[0].log_records[0];
         assert_eq!(
             record.body.as_ref().unwrap().value,
@@ -1125,6 +1381,7 @@ mod tests {
         else {
             panic!("expected metrics signal");
         };
+        let request = ExportMetricsServiceRequest::decode(request).unwrap();
         assert_eq!(
             request.resource_metrics[0].scope_metrics[0].metrics[0].name,
             "test_metric"
@@ -1144,6 +1401,7 @@ mod tests {
             else {
                 panic!("expected traces signal");
             };
+            let request = ExportTraceServiceRequest::decode(request).unwrap();
             assert_eq!(
                 request.resource_spans[0].scope_spans[0].spans[0].name,
                 "test_span"
