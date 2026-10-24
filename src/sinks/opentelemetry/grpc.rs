@@ -906,15 +906,17 @@ where
                 // TODO(perf): OtlpSerializer only exposes a byte-level Encoder interface, so
                 // encode_event must encode to bytes and then decode back to a typed proto struct.
                 // Exposing a typed output from OtlpSerializer would eliminate this roundtrip.
-                let signal = encode_event(&mut serializer, &event);
+                let mut json_byte_size = telemetry().create_request_count_byte_size();
+                json_byte_size.add_event(&event, event.estimated_json_encoded_size_of());
+                let byte_size = event.size_of();
+                let finalizers = event.take_finalizers();
+                let signal = encode_event(&mut serializer, event);
                 match signal {
                     Ok(Some(signal)) => {
-                        let mut json_byte_size = telemetry().create_request_count_byte_size();
-                        json_byte_size.add_event(&event, event.estimated_json_encoded_size_of());
                         let data = OtlpEventData {
-                            byte_size: event.size_of(),
+                            byte_size,
                             json_byte_size,
-                            finalizers: event.take_finalizers(),
+                            finalizers,
                             signal,
                             uri,
                             dynamic_headers,
@@ -927,12 +929,12 @@ where
                         // OTLP-structured events; plain log events from non-OTLP sources
                         // must be encoded with an OTLP codec before reaching this sink.
                         reject_event(
-                            event.take_finalizers(),
+                            finalizers,
                             "event is not OTLP-encoded (missing resourceLogs, resourceMetrics, \
                              or resourceSpans field); this sink only accepts OTLP-structured events",
                         )
                     }
-                    Err(e) => reject_event(event.take_finalizers(), e.to_string()),
+                    Err(e) => reject_event(finalizers, e.to_string()),
                 }
             })
             // Partition by (rendered URI, dynamic headers) so that events destined for
@@ -1005,20 +1007,19 @@ where
 /// serializer). Returns `Err` for unexpected encoding failures.
 fn encode_event(
     serializer: &mut OtlpSerializer,
-    event: &Event,
+    event: Event,
 ) -> Result<Option<OtlpSignal>, vector_common::Error> {
     let mut buf = BytesMut::new();
-    // Clone the event to pass ownership to the encoder while keeping the original
-    // for metadata extraction in the caller. The clone is shallow for logs/traces.
-    match event {
+    // Consuming the event avoids a copy-on-write clone in LogEvent::into_parts.
+    match &event {
         Event::Log(log) if log.contains(event_path!(RESOURCE_LOGS_JSON_FIELD)) => {
-            serializer.encode(event.clone(), &mut buf)?;
+            serializer.encode(event, &mut buf)?;
             Ok(Some(OtlpSignal::Logs(ExportLogsServiceRequest::decode(
                 buf.freeze(),
             )?)))
         }
         Event::Log(log) if log.contains(event_path!(RESOURCE_METRICS_JSON_FIELD)) => {
-            serializer.encode(event.clone(), &mut buf)?;
+            serializer.encode(event, &mut buf)?;
             Ok(Some(OtlpSignal::Metrics(
                 ExportMetricsServiceRequest::decode(buf.freeze())?,
             )))
@@ -1026,13 +1027,13 @@ fn encode_event(
         // OTLP spans can arrive as Log events when the source does not use
         // use_otlp_decoding.traces = true.
         Event::Log(log) if log.contains(event_path!(RESOURCE_SPANS_JSON_FIELD)) => {
-            serializer.encode(event.clone(), &mut buf)?;
+            serializer.encode(event, &mut buf)?;
             Ok(Some(OtlpSignal::Traces(ExportTraceServiceRequest::decode(
                 buf.freeze(),
             )?)))
         }
         Event::Trace(trace) if trace.contains(event_path!(RESOURCE_SPANS_JSON_FIELD)) => {
-            serializer.encode(event.clone(), &mut buf)?;
+            serializer.encode(event, &mut buf)?;
             Ok(Some(OtlpSignal::Traces(ExportTraceServiceRequest::decode(
                 buf.freeze(),
             )?)))
@@ -1088,7 +1089,95 @@ fn signal_into_request<R: prost::Message>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::{BatchNotifier, BatchStatus, LogEvent, TraceEvent};
     use crate::sinks::util::grpc::with_default_scheme;
+
+    #[test]
+    fn encode_owned_otlp_signals() {
+        let mut serializer = OtlpSerializer::new().unwrap();
+        let log = LogEvent::try_from(serde_json::json!({
+            "resourceLogs": [{"scopeLogs": [{"logRecords": [{
+                "body": {"stringValue": "log body"}
+            }]}]}]
+        }))
+        .unwrap();
+        let Some(OtlpSignal::Logs(request)) =
+            encode_event(&mut serializer, Event::Log(log)).unwrap()
+        else {
+            panic!("expected logs signal");
+        };
+        let record = &request.resource_logs[0].scope_logs[0].log_records[0];
+        assert_eq!(
+            record.body.as_ref().unwrap().value,
+            Some(
+                vector_lib::opentelemetry::proto::common::v1::any_value::Value::StringValue(
+                    "log body".to_owned()
+                )
+            )
+        );
+
+        let metric = LogEvent::try_from(serde_json::json!({
+            "resourceMetrics": [{"scopeMetrics": [{"metrics": [{"name": "test_metric"}]}]}]
+        }))
+        .unwrap();
+        let Some(OtlpSignal::Metrics(request)) =
+            encode_event(&mut serializer, Event::Log(metric)).unwrap()
+        else {
+            panic!("expected metrics signal");
+        };
+        assert_eq!(
+            request.resource_metrics[0].scope_metrics[0].metrics[0].name,
+            "test_metric"
+        );
+
+        for trace_event in [false, true] {
+            let trace = LogEvent::try_from(serde_json::json!({
+                "resourceSpans": [{"scopeSpans": [{"spans": [{"name": "test_span"}]}]}]
+            }))
+            .unwrap();
+            let event = if trace_event {
+                Event::Trace(TraceEvent::from(trace))
+            } else {
+                Event::Log(trace)
+            };
+            let Some(OtlpSignal::Traces(request)) = encode_event(&mut serializer, event).unwrap()
+            else {
+                panic!("expected traces signal");
+            };
+            assert_eq!(
+                request.resource_spans[0].scope_spans[0].spans[0].name,
+                "test_span"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_events_after_taking_ownership() {
+        for value in [
+            serde_json::json!({"message": "not an OTLP event"}),
+            serde_json::json!({"resourceLogs": "invalid protobuf field"}),
+        ] {
+            let config: GrpcSinkConfig =
+                toml::from_str(r#"uri = "http://127.0.0.1:4317""#).unwrap();
+            let validated = config.validate().unwrap();
+            let (sink, _) = config
+                .build_from_validated(&validated, SinkContext::default())
+                .await
+                .unwrap();
+            let (batch, receiver) = BatchNotifier::new_with_receiver();
+            let event = LogEvent::try_from(value)
+                .unwrap()
+                .with_batch_notifier(&batch);
+            drop(batch);
+            sink.run_events([Event::Log(event)]).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(1), receiver)
+                    .await
+                    .expect("event finalizer was not completed"),
+                BatchStatus::Rejected
+            );
+        }
+    }
 
     #[test]
     fn generate_grpc_config() {
