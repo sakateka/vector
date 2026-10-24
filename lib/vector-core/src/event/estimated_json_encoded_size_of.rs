@@ -5,7 +5,7 @@ use chrono::{DateTime, Timelike, Utc};
 use ordered_float::NotNan;
 use smallvec::SmallVec;
 use vector_common::json_size::JsonSize;
-use vrl::value::{KeyString, Value};
+use vrl::value::{KeyString, ObjectMap, Value};
 
 const NULL_SIZE: JsonSize = JsonSize::new(4);
 const TRUE_SIZE: JsonSize = JsonSize::new(4);
@@ -134,6 +134,22 @@ impl EstimatedJsonEncodedSizeOf for f32 {
 impl<T: EstimatedJsonEncodedSizeOf + Copy> EstimatedJsonEncodedSizeOf for NotNan<T> {
     fn estimated_json_encoded_size_of(&self) -> JsonSize {
         self.into_inner().estimated_json_encoded_size_of()
+    }
+}
+
+impl EstimatedJsonEncodedSizeOf for ObjectMap {
+    fn estimated_json_encoded_size_of(&self) -> JsonSize {
+        let size = self.iter().fold(BRACES_SIZE, |acc, (key, value)| {
+            acc + key.as_str().estimated_json_encoded_size_of().get()
+                + COLON_SIZE
+                + value.estimated_json_encoded_size_of().get()
+                + COMMA_SIZE
+        });
+        JsonSize::new(if size > BRACES_SIZE {
+            size - COMMA_SIZE
+        } else {
+            size
+        })
     }
 }
 

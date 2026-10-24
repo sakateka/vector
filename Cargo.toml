@@ -565,6 +565,7 @@ wiremock = "0.6.4"
 zstd = { workspace = true, features = ["zdict_builder"] }
 
 [patch.crates-io]
+vrl = { git = "https://github.com/sakateka/vrl.git", rev = "50be0333b4514c0439fa92bb8a65fe7a3ba3a0b9" }
 # The `heim` crates depend on `ntapi` 0.3.7 on Windows, but that version has an
 # unaligned access bug fixed in the following revision.
 ntapi = { git = "https://github.com/MSxDOS/ntapi.git", rev = "24fc1e47677fc9f6e38e5f154e6011dc9b270da6" }

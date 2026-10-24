@@ -35,6 +35,7 @@ pub fn is_allocation_tracing_enabled() -> bool {
 }
 
 /// Track allocations and deallocations separately.
+#[repr(align(64))]
 struct GroupMemStatsStorage {
     allocations: [AtomicU64; NUM_GROUPS],
     deallocations: [AtomicU64; NUM_GROUPS],

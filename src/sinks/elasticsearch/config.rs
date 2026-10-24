@@ -1,7 +1,4 @@
-use std::{
-    collections::{BTreeMap, HashMap},
-    convert::TryFrom,
-};
+use std::{collections::HashMap, convert::TryFrom};
 
 use futures::{FutureExt, TryFutureExt};
 use vector_lib::{
@@ -531,13 +528,13 @@ impl DataStreamMode {
         let namespace = self.namespace(&*log);
 
         if log.as_map().is_none() {
-            *log.value_mut() = Value::Object(BTreeMap::new());
+            *log.value_mut() = Value::Object(vrl::value::ObjectMap::new());
         }
         let existing = log
             .as_map_mut()
             .expect("must be a map")
             .entry("data_stream".into())
-            .or_insert_with(|| Value::Object(BTreeMap::new()))
+            .or_insert_with(|| Value::Object(vrl::value::ObjectMap::new()))
             .as_object_mut_unwrap();
 
         if let Some(dtype) = dtype {
@@ -603,7 +600,7 @@ impl DataStreamMode {
 /// back to `fallback` (normal template rendering) when the event field is
 /// missing.
 fn auto_routed_value<F>(
-    data_stream: Option<&std::collections::BTreeMap<vector_lib::event::KeyString, Value>>,
+    data_stream: Option<&vrl::value::ObjectMap>,
     key: &str,
     template: &ConfinedTemplate,
     field: &'static str,

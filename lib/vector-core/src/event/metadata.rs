@@ -367,10 +367,12 @@ pub(super) fn default_schema_definition() -> Arc<schema::Definition> {
 
 impl ByteSizeOf for EventMetadata {
     fn allocated_bytes(&self) -> usize {
-        // NOTE we don't count the `str` here because it's allocated somewhere
-        // else. We're just moving around the pointer, which is already captured
-        // by `ByteSizeOf::size_of`.
-        self.inner.finalizers.allocated_bytes()
+        // Shared schema and component identities are not charged to individual events.
+        self.inner
+            .value
+            .allocated_bytes()
+            .saturating_add(self.inner.dropped_fields.allocated_bytes())
+            .saturating_add(self.inner.finalizers.allocated_bytes())
     }
 }
 
@@ -705,5 +707,27 @@ mod test {
             merged.merge(m1);
             assert_eq!(merged.source_event_id(), m2.source_event_id());
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn metadata_values_and_dropped_fields_keep_their_buffer_charge() {
+        let mut metadata = EventMetadata::default();
+        let baseline = metadata.allocated_bytes();
+        metadata.get_mut().value = Value::Array(Vec::with_capacity(1024));
+        assert!(metadata.allocated_bytes() >= baseline + 1024 * size_of::<Value>());
+        metadata.get_mut().value = Value::Null;
+        assert_eq!(metadata.allocated_bytes(), baseline);
+        metadata
+            .get_mut()
+            .dropped_fields
+            .insert("held".into(), Value::Array(Vec::with_capacity(1024)));
+        assert!(metadata.allocated_bytes() >= baseline + 1024 * size_of::<Value>());
+        metadata.get_mut().dropped_fields.clear();
+        assert_eq!(metadata.allocated_bytes(), baseline);
     }
 }

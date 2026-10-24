@@ -27,6 +27,7 @@ apache-avro,https://github.com/apache/avro-rs,Apache-2.0,The apache-avro Authors
 approx,https://github.com/brendanzab/approx,Apache-2.0,Brendan Zabarauskas <bjzaba@yahoo.com.au>
 arbitrary,https://github.com/rust-fuzz/arbitrary,MIT OR Apache-2.0,"The Rust-Fuzz Project Developers, Nick Fitzgerald <fitzgen@gmail.com>, Manish Goregaokar <manishsmail@gmail.com>, Simonas Kazlauskas <arbitrary@kazlauskas.me>, Brian L. Troutwine <brian@troutwine.us>, Corey Farwell <coreyf@rwell.org>"
 arc-swap,https://github.com/vorner/arc-swap,MIT OR Apache-2.0,Michal 'vorner' Vaner <vorner@vorner.cz>
+arena-btreemap,https://github.com/guan-tends/arena-btreemap,MIT OR Apache-2.0,The arena-btreemap Authors
 arr_macro,https://github.com/JoshMcguigan/arr_macro,MIT OR Apache-2.0,Josh Mcguigan
 arr_macro_impl,https://github.com/JoshMcguigan/arr_macro,MIT OR Apache-2.0,Josh Mcguigan
 arraydeque,https://github.com/andylokandy/arraydeque,MIT OR Apache-2.0,andylokandy

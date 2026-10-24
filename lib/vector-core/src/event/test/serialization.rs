@@ -24,25 +24,19 @@ fn decode_value<T: Encodable, B: Buf + Clone>(buffer: B) -> T {
     T::decode(T::get_metadata(), buffer).expect("decoding should not fail")
 }
 
-// Ser/De the EventArray never loses bytes
+// Wire encoding preserves values, while retained container capacity is rebuilt.
 #[test]
-fn serde_eventarray_no_size_loss() {
-    fn inner(events: EventArray) -> TestResult {
-        let expected = events.clone();
-
-        let mut buffer = BytesMut::with_capacity(64);
-        encode_value(events, &mut buffer);
-
-        let actual = decode_value::<EventArray, _>(buffer);
-        assert_eq!(actual.size_of(), expected.size_of());
-
-        TestResult::passed()
-    }
-
-    QuickCheck::new()
-        .tests(1_000)
-        .max_tests(10_000)
-        .quickcheck(inner as fn(EventArray) -> TestResult);
+fn round_trip_recomputes_retained_storage() {
+    let mut values = Vec::with_capacity(4096);
+    values.push(Value::Integer(42));
+    let events = EventArray::from(Event::Log(LogEvent::from(Value::Array(values))));
+    let original_charge = events.size_of();
+    let expected = events.clone();
+    let mut buffer = BytesMut::with_capacity(64);
+    encode_value(events, &mut buffer);
+    let decoded = decode_value::<EventArray, _>(buffer);
+    assert_eq!(decoded, expected);
+    assert!(decoded.size_of() < original_charge);
 }
 
 // Ser/De the EventArray type through EncodeBytes -> DecodeBytes

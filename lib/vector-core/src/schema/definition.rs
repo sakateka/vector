@@ -659,7 +659,7 @@ mod tests {
                     [LogNamespace::Legacy],
                 ),
                 event: Event::Log(LogEvent::from_parts(
-                    Value::Object(BTreeMap::new()),
+                    Value::Object(vrl::value::ObjectMap::new()),
                     EventMetadata::default_with_value(
                         BTreeMap::from([("foo".into(), 4.into())]).into(),
                     ),
