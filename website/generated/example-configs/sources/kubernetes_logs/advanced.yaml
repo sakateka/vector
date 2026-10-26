@@ -17,6 +17,17 @@ sources:
     ingestion_timestamp_field: .ingest_timestamp
     insert_namespace_fields: true
     kube_config_file: /path/to/.kube/config
+    label_filters:
+      namespace:
+        includes: []
+      node:
+        includes:
+          - topology.kubernetes.io/zone
+      pod:
+        excludes:
+          - app.kubernetes.io/version
+        includes:
+          - app.kubernetes.io/*
     max_line_bytes: 32768
     max_merged_line_action: drop
     max_read_bytes: 2048

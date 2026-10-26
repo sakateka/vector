@@ -181,6 +181,49 @@ generated: components: sources: kubernetes_logs: configuration: {
 		required: false
 		type: string: examples: ["/path/to/.kube/config"]
 	}
+	label_filters: {
+		description: """
+			Selects Pod, Namespace, and Node labels before storing objects in the source cache.
+
+			Each scope defaults to all labels. Exclusions override inclusions, and an empty includes
+			list selects no labels.
+
+			Patterns match the entire key and are case-sensitive. Literal patterns match exactly.
+			`*` matches any sequence, including dots and slashes, and `?` matches one character.
+			`[abc]` or `[a-z]` matches a character set or range; `[!abc]` negates a set.
+			Match a metacharacter literally with brackets, for example `[*]`.
+			Consecutive stars are only valid as a whole path component (`**`); use `*` for label prefixes.
+			Invalid patterns are rejected when loading configuration.
+			"""
+		required: false
+		type: object: {
+			examples: [{
+				namespace: includes: []
+				node: includes: ["topology.kubernetes.io/zone"]
+				pod: {
+					excludes: ["app.kubernetes.io/version"]
+					includes: ["app.kubernetes.io/*"]
+				}
+			}]
+			options: {
+				namespace: {
+					description: "Filter for Namespace label keys."
+					required:    false
+					type:        _schemaDefinitions["vector::sources::kubernetes_logs::label_filter::LabelFilter"]
+				}
+				node: {
+					description: "Filter for Node label keys."
+					required:    false
+					type:        _schemaDefinitions["vector::sources::kubernetes_logs::label_filter::LabelFilter"]
+				}
+				pod: {
+					description: "Filter for Pod label keys."
+					required:    false
+					type:        _schemaDefinitions["vector::sources::kubernetes_logs::label_filter::LabelFilter"]
+				}
+			}
+		}
+	}
 	max_line_bytes: {
 		description: """
 			The maximum number of bytes a line can contain before being discarded.

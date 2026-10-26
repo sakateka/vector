@@ -64,6 +64,7 @@ use crate::{
 };
 
 mod k8s_paths_provider;
+mod label_filter;
 mod lifecycle;
 mod namespace_metadata_annotator;
 mod node_metadata_annotator;
@@ -75,7 +76,7 @@ mod transform_utils;
 mod util;
 
 use self::{
-    namespace_metadata_annotator::NamespaceMetadataAnnotator,
+    label_filter::LabelFilters, namespace_metadata_annotator::NamespaceMetadataAnnotator,
     node_metadata_annotator::NodeMetadataAnnotator, parser::Parser,
     pod_metadata_annotator::PodMetadataAnnotator,
 };
@@ -171,6 +172,19 @@ pub struct Config {
     namespace_annotation_fields: namespace_metadata_annotator::FieldsSpec,
 
     node_annotation_fields: node_metadata_annotator::FieldsSpec,
+
+    /// Selects Pod, Namespace, and Node labels before storing objects in the source cache.
+    ///
+    /// Each scope defaults to all labels. Exclusions override inclusions, and an empty includes
+    /// list selects no labels.
+    ///
+    /// Patterns match the entire key and are case-sensitive. Literal patterns match exactly.
+    /// `*` matches any sequence, including dots and slashes, and `?` matches one character.
+    /// `[abc]` or `[a-z]` matches a character set or range; `[!abc]` negates a set.
+    /// Match a metacharacter literally with brackets, for example `[*]`.
+    /// Consecutive stars are only valid as a whole path component (`**`); use `*` for label prefixes.
+    /// Invalid patterns are rejected when loading configuration.
+    label_filters: LabelFilters,
 
     /// A list of glob patterns to include while reading the files.
     #[configurable(metadata(docs::examples = "**/include/**"))]
@@ -330,6 +344,7 @@ impl Default for Config {
             auto_partial_merge: true,
             data_dir: None,
             pod_annotation_fields: pod_metadata_annotator::FieldsSpec::default(),
+            label_filters: LabelFilters::default(),
             namespace_annotation_fields: namespace_metadata_annotator::FieldsSpec::default(),
             node_annotation_fields: node_metadata_annotator::FieldsSpec::default(),
             include_paths_glob_patterns: default_path_inclusion(),
@@ -618,6 +633,7 @@ struct Source {
     pod_fields_spec: pod_metadata_annotator::FieldsSpec,
     namespace_fields_spec: namespace_metadata_annotator::FieldsSpec,
     node_field_spec: node_metadata_annotator::FieldsSpec,
+    label_filters: LabelFilters,
     field_selector: String,
     label_selector: String,
     namespace_label_selector: String,
@@ -641,6 +657,13 @@ struct Source {
     include_file_metric_tag: bool,
     rotate_wait: Duration,
     pod_counters_sweep_interval: Option<Duration>,
+}
+
+struct Reflectors {
+    pod_state: reflector::store::Store<Pod>,
+    namespace_state: reflector::store::Store<Namespace>,
+    node_state: reflector::store::Store<Node>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl Source {
@@ -709,6 +732,7 @@ impl Source {
             pod_fields_spec: config.pod_annotation_fields.clone(),
             namespace_fields_spec: config.namespace_annotation_fields.clone(),
             node_field_spec: config.node_annotation_fields.clone(),
+            label_filters: config.label_filters.clone(),
             field_selector,
             label_selector,
             namespace_label_selector,
@@ -735,47 +759,16 @@ impl Source {
         })
     }
 
-    #[allow(
-        clippy::too_many_lines,
-        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
-    )]
-    async fn run(
-        self,
-        mut out: SourceSender,
-        global_shutdown: ShutdownSignal,
-        log_namespace: LogNamespace,
-    ) -> crate::Result<()> {
-        let Self {
-            client,
-            data_dir,
-            auto_partial_merge,
-            pod_fields_spec,
-            namespace_fields_spec,
-            node_field_spec,
-            field_selector,
-            label_selector,
-            namespace_label_selector,
-            insert_namespace_fields,
-            node_selector,
-            self_node_name,
-            include_paths,
-            exclude_paths,
-            read_from,
-            ignore_older_secs,
-            max_read_bytes,
-            oldest_first,
-            max_line_bytes,
-            max_merged_line_bytes,
-            max_merged_line_action,
-            fingerprint_lines,
-            glob_minimum_cooldown,
-            use_apiserver_cache,
-            ingestion_timestamp_field,
-            delay_deletion,
-            include_file_metric_tag,
-            rotate_wait,
-            pod_counters_sweep_interval,
-        } = self;
+    fn create_reflectors(&self) -> Reflectors {
+        let client = self.client.clone();
+        let label_filters = self.label_filters.clone();
+        let field_selector = self.field_selector.clone();
+        let label_selector = self.label_selector.clone();
+        let namespace_label_selector = self.namespace_label_selector.clone();
+        let node_selector = self.node_selector.clone();
+        let insert_namespace_fields = self.insert_namespace_fields;
+        let use_apiserver_cache = self.use_apiserver_cache;
+        let delay_deletion = self.delay_deletion;
 
         let mut reflectors = Vec::new();
 
@@ -797,7 +790,8 @@ impl Source {
                 ..Default::default()
             },
         )
-        .backoff(watcher::DefaultBackoff::default());
+        .backoff(watcher::DefaultBackoff::default())
+        .modify(move |pod| label_filters.pod.retain(&mut pod.metadata.labels));
 
         let pod_store_w = reflector::store::Writer::default();
         let pod_state = pod_store_w.as_reader();
@@ -825,7 +819,12 @@ impl Source {
                     ..Default::default()
                 },
             )
-            .backoff(watcher::DefaultBackoff::default());
+            .backoff(watcher::DefaultBackoff::default())
+            .modify(move |namespace| {
+                label_filters
+                    .namespace
+                    .retain(&mut namespace.metadata.labels);
+            });
 
             reflectors.push(crate::spawn_in_current_span(custom_reflector(
                 ns_store_w,
@@ -847,7 +846,8 @@ impl Source {
                 ..Default::default()
             },
         )
-        .backoff(watcher::DefaultBackoff::default());
+        .backoff(watcher::DefaultBackoff::default())
+        .modify(move |node| label_filters.node.retain(&mut node.metadata.labels));
         let node_store_w = reflector::store::Writer::default();
         let node_state = node_store_w.as_reader();
         let node_cacher = MetaCache::new();
@@ -858,6 +858,56 @@ impl Source {
             node_watcher,
             delay_deletion,
         )));
+
+        Reflectors {
+            pod_state,
+            namespace_state: ns_state,
+            node_state,
+            tasks: reflectors,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Splitting this source routine is deferred to keep the lint cleanup mechanical. https://github.com/vectordotdev/vector/issues/23659"
+    )]
+    async fn run(
+        self,
+        mut out: SourceSender,
+        global_shutdown: ShutdownSignal,
+        log_namespace: LogNamespace,
+    ) -> crate::Result<()> {
+        let Reflectors {
+            pod_state,
+            namespace_state: ns_state,
+            node_state,
+            tasks: reflectors,
+        } = self.create_reflectors();
+        let Self {
+            data_dir,
+            auto_partial_merge,
+            pod_fields_spec,
+            namespace_fields_spec,
+            node_field_spec,
+            insert_namespace_fields,
+            self_node_name,
+            include_paths,
+            exclude_paths,
+            read_from,
+            ignore_older_secs,
+            max_read_bytes,
+            oldest_first,
+            max_line_bytes,
+            max_merged_line_bytes,
+            max_merged_line_action,
+            fingerprint_lines,
+            glob_minimum_cooldown,
+            ingestion_timestamp_field,
+            include_file_metric_tag,
+            rotate_wait,
+            pod_counters_sweep_interval,
+            ..
+        } = self;
 
         let paths_provider = K8sPathsProvider::new(
             pod_state.clone(),
@@ -1308,20 +1358,510 @@ fn resolve_max_line_bytes(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use indoc::indoc;
+    use k8s_openapi::{
+        api::core::v1::{
+            Namespace, NamespaceSpec, NamespaceStatus, Node, NodeSpec, NodeStatus, Pod, PodSpec,
+            PodStatus,
+        },
+        apimachinery::pkg::apis::meta::v1::ObjectMeta,
+    };
     use similar_asserts::assert_eq;
     use vector_lib::{
         codecs::OversizedAction,
         config::LogNamespace,
-        lookup::{OwnedTargetPath, owned_value_path},
+        lookup::{
+            OwnedTargetPath, event_path, lookup_v2::parse_target_path, metadata_path,
+            owned_value_path,
+        },
         schema::Definition,
     };
     use vrl::value::{Kind, kind::Collection};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path},
+    };
 
-    use super::Config;
-    use crate::config::SourceConfig;
+    use super::{
+        Config, NamespaceMetadataAnnotator, NodeMetadataAnnotator, PodMetadataAnnotator,
+        Reflectors, Source,
+    };
+    use crate::{
+        config::{ComponentKey, Format, GlobalOptions, SourceConfig, load},
+        event::{Event, LogEvent},
+    };
+
+    #[test]
+    fn label_filters_configuration() {
+        let keys = ["app", "app.extra", "app.kubernetes.io/name", "App", "zone"];
+        let cases = [
+            (
+                "{}",
+                vec!["app", "app.extra", "app.kubernetes.io/name", "App", "zone"],
+            ),
+            (
+                "includes: null",
+                vec!["app", "app.extra", "app.kubernetes.io/name", "App", "zone"],
+            ),
+            ("includes: []", vec![]),
+            (
+                "excludes: []",
+                vec!["app", "app.extra", "app.kubernetes.io/name", "App", "zone"],
+            ),
+            (
+                "excludes: [app]",
+                vec!["app.extra", "app.kubernetes.io/name", "App", "zone"],
+            ),
+            ("includes: [app, missing]", vec!["app"]),
+            (
+                "includes: [app.kubernetes.io/name]",
+                vec!["app.kubernetes.io/name"],
+            ),
+            ("includes: [app.kubernetes.io]", vec![]),
+            (
+                "includes: ['app*', 'app.kubernetes.io/*']",
+                vec!["app", "app.extra", "app.kubernetes.io/name"],
+            ),
+            (
+                "includes: ['*']",
+                vec!["app", "app.extra", "app.kubernetes.io/name", "App", "zone"],
+            ),
+            ("includes: ['app*']\nexcludes: ['app.*']", vec!["app"]),
+            ("includes: ['[a]pp', 'zon?']", vec!["app", "zone"]),
+            ("includes: ['[a-z]pp']", vec!["app"]),
+            ("includes: ['[!A]pp']", vec!["app"]),
+            (
+                "includes: ['app.kubernetes.io/**']",
+                vec!["app.kubernetes.io/name"],
+            ),
+            ("includes: ['**/name']", vec!["app.kubernetes.io/name"]),
+        ];
+        for scope in ["pod", "namespace", "node"] {
+            for (yaml, expected) in &cases {
+                let yaml = format!(
+                    "label_filters:\n  {scope}:\n    {}",
+                    yaml.replace('\n', "\n    ")
+                );
+                let config: Config = load(yaml.as_bytes(), Format::Yaml).unwrap();
+                let filter = match scope {
+                    "pod" => &config.label_filters.pod,
+                    "namespace" => &config.label_filters.namespace,
+                    _ => &config.label_filters.node,
+                };
+                let mut labels = Some(keys.map(|key| (key.to_owned(), String::new())).into());
+                filter.retain(&mut labels);
+                let selected: Vec<_> = keys
+                    .into_iter()
+                    .filter(|key| labels.as_ref().unwrap().contains_key(*key))
+                    .collect();
+                assert_eq!(&selected, expected, "{yaml}");
+            }
+        }
+        let config: Config = load("{}".as_bytes(), Format::Yaml).unwrap();
+        for filter in [
+            &config.label_filters.pod,
+            &config.label_filters.namespace,
+            &config.label_filters.node,
+        ] {
+            let mut labels = Some([("any/key".to_owned(), "value".to_owned())].into());
+            let expected = labels.clone();
+            filter.retain(&mut labels);
+            assert_eq!(labels, expected);
+        }
+        for (pattern, literal) in [("[*]", "*"), ("[?]", "?"), ("[[]", "["), ("[]]", "]")] {
+            let yaml = format!("label_filters: {{pod: {{includes: ['{pattern}']}}}}");
+            let config: Config = load(yaml.as_bytes(), Format::Yaml).unwrap();
+            let mut labels = Some([(literal.to_owned(), String::new())].into());
+            config.label_filters.pod.retain(&mut labels);
+            assert!(labels.as_ref().unwrap().contains_key(literal), "{pattern}");
+        }
+    }
+
+    #[test]
+    fn label_filters_reject_invalid_configuration() {
+        for scope in ["pod", "namespace", "node"] {
+            for yaml in [
+                "includes: ['[']",
+                "excludes: ['[']",
+                "includes: ['a**']",
+                "includes: app",
+                "excludes: app",
+                "includes: [1]",
+                "excludes: [true]",
+                "includes: [null]",
+                "includes: [{}]",
+                "excludes: [[]]",
+                "include: [app]",
+            ] {
+                let yaml = format!("label_filters:\n  {scope}:\n    {yaml}");
+                assert!(
+                    load::<_, Config>(yaml.as_bytes(), Format::Yaml).is_err(),
+                    "{yaml}"
+                );
+            }
+        }
+        for yaml in [
+            "label_filters: {other: {}}",
+            "label_filters: invalid",
+            "label_filters: {pod: invalid}",
+            "node_annotation_fields: {node_labels_include: [app]}",
+        ] {
+            assert!(
+                load::<_, Config>(yaml.as_bytes(), Format::Yaml).is_err(),
+                "{yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn label_filters_configuration_round_trip() {
+        for yaml in [
+            "{}",
+            "label_filters: {pod: {includes: null}}",
+            "label_filters: {pod: {includes: []}}",
+            "label_filters: {pod: {includes: ['app.?', '[a-z]*'], excludes: ['*/version']}}",
+        ] {
+            let config: Config = load(yaml.as_bytes(), Format::Yaml).unwrap();
+            let expected = serde_json::to_value(&config.label_filters).unwrap();
+            for (serialized, format) in [
+                (serde_yaml::to_string(&config).unwrap(), Format::Yaml),
+                (serde_json::to_string(&config).unwrap(), Format::Json),
+                (toml::to_string(&config).unwrap(), Format::Toml),
+            ] {
+                let actual: Config = load(serialized.as_bytes(), format).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&actual.label_filters).unwrap(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "Exercises production watch/cache setup and all enrichment destinations together."
+    )]
+    #[tokio::test]
+    async fn label_filters_enrich_independently_and_preserve_metadata() {
+        let labels: BTreeMap<_, _> = [
+            ("app.kubernetes.io/name".to_owned(), "api".to_owned()),
+            ("app.kubernetes.io/version".to_owned(), "v1".to_owned()),
+            (
+                "topology.kubernetes.io/zone".to_owned(),
+                "zone-a".to_owned(),
+            ),
+        ]
+        .into();
+        let metadata = ObjectMeta {
+            name: Some("test".to_owned()),
+            namespace: Some("default".to_owned()),
+            labels: Some(labels.clone()),
+            annotations: Some(
+                [("app.kubernetes.io/name".to_owned(), "annotation".to_owned())].into(),
+            ),
+            ..ObjectMeta::default()
+        };
+        let mut pod = Pod {
+            spec: Some(PodSpec {
+                node_name: Some("node".to_owned()),
+                ..PodSpec::default()
+            }),
+            status: Some(PodStatus {
+                pod_ip: Some("10.0.0.1".to_owned()),
+                ..PodStatus::default()
+            }),
+            metadata: metadata.clone(),
+        };
+        let mut namespace = Namespace {
+            spec: Some(NamespaceSpec {
+                finalizers: Some(vec!["kubernetes".to_owned()]),
+            }),
+            status: Some(NamespaceStatus {
+                phase: Some("Active".to_owned()),
+                ..NamespaceStatus::default()
+            }),
+            metadata: ObjectMeta {
+                name: Some("default".to_owned()),
+                namespace: None,
+                ..metadata.clone()
+            },
+        };
+        let mut node = Node {
+            spec: Some(NodeSpec {
+                unschedulable: Some(true),
+                ..NodeSpec::default()
+            }),
+            status: Some(NodeStatus {
+                phase: Some("Running".to_owned()),
+                ..NodeStatus::default()
+            }),
+            metadata: ObjectMeta {
+                name: Some("node".to_owned()),
+                namespace: None,
+                ..metadata
+            },
+        };
+        let server = MockServer::start().await;
+        for (resource, kind, object) in [
+            ("pods", "PodList", serde_json::to_value(&pod).unwrap()),
+            (
+                "namespaces",
+                "NamespaceList",
+                serde_json::to_value(&namespace).unwrap(),
+            ),
+            ("nodes", "NodeList", serde_json::to_value(&node).unwrap()),
+        ] {
+            let list = serde_json::json!({
+                "apiVersion": "v1",
+                "kind": kind,
+                "metadata": {"resourceVersion": "1"},
+                "items": [object]
+            });
+            Mock::given(method("GET"))
+                .and(path(format!("/api/v1/{resource}")))
+                .respond_with(move |request: &wiremock::Request| {
+                    if request
+                        .url
+                        .query_pairs()
+                        .any(|(key, value)| key == "watch" && value == "true")
+                    {
+                        // Keep watch requests pending; this test inspects the initial list.
+                        ResponseTemplate::new(200).set_delay(Duration::from_mins(1))
+                    } else {
+                        ResponseTemplate::new(200).set_body_json(&list)
+                    }
+                })
+                .mount(&server)
+                .await;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let kube_config_file = directory.path().join("kubeconfig.yaml");
+        std::fs::write(
+            &kube_config_file,
+            format!(
+                indoc! {"
+                    apiVersion: v1
+                    kind: Config
+                    clusters:
+                    - name: test
+                      cluster:
+                        server: {}
+                    contexts:
+                    - name: test
+                      context:
+                        cluster: test
+                        user: test
+                    current-context: test
+                    users:
+                    - name: test
+                      user: {{}}
+                "},
+                server.uri()
+            ),
+        )
+        .unwrap();
+        let mut config = label_filter_config("default");
+        config.self_node_name = "node".to_owned();
+        config.kube_config_file = Some(kube_config_file);
+        config.data_dir = Some(directory.path().to_owned());
+        let source = Source::new(
+            &config,
+            &GlobalOptions::default(),
+            &ComponentKey::from("kubernetes"),
+        )
+        .await
+        .unwrap();
+        let Reflectors {
+            pod_state: pods,
+            namespace_state: namespaces,
+            node_state: nodes,
+            tasks,
+        } = source.create_reflectors();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::try_join!(
+                pods.wait_until_ready(),
+                namespaces.wait_until_ready(),
+                nodes.wait_until_ready()
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        for log_namespace in [LogNamespace::Legacy, LogNamespace::Vector] {
+            for destination in ["default", "custom", ""] {
+                let config = label_filter_config(destination);
+                let mut log = LogEvent::default();
+                log.insert(event_path!("message"), "original");
+                log.insert(metadata_path!("unrelated", "key"), "preserved");
+                // Existing labels are not deleted, even when a filter selects no new labels.
+                log.insert(
+                    event_path!("kubernetes", "namespace_labels", "existing"),
+                    "preserved",
+                );
+                log.insert(
+                    metadata_path!("kubernetes_logs", "namespace_labels", "existing"),
+                    "preserved",
+                );
+                let mut event = Event::Log(log);
+                PodMetadataAnnotator::new(
+                    pods.clone(),
+                    config.pod_annotation_fields,
+                    log_namespace,
+                )
+                .annotate(&mut event, "/var/log/pods/default_test_uid/container/0.log")
+                .unwrap();
+                NamespaceMetadataAnnotator::new(
+                    namespaces.clone(),
+                    config.namespace_annotation_fields,
+                    log_namespace,
+                )
+                .annotate(&mut event, "default")
+                .unwrap();
+                NodeMetadataAnnotator::new(
+                    nodes.clone(),
+                    config.node_annotation_fields,
+                    log_namespace,
+                )
+                .annotate(&mut event, "node")
+                .unwrap();
+                let log = event.as_log();
+                assert_filtered_enrichment(log, log_namespace, destination, &labels);
+            }
+        }
+        pod.metadata.labels =
+            Some([("app.kubernetes.io/name".to_owned(), "api".to_owned())].into());
+        namespace.metadata.labels = Some(BTreeMap::new());
+        node.metadata.labels = Some(
+            [(
+                "topology.kubernetes.io/zone".to_owned(),
+                "zone-a".to_owned(),
+            )]
+            .into(),
+        );
+        assert_eq!(pods.state(), vec![Arc::new(pod)]);
+        assert_eq!(namespaces.state(), vec![Arc::new(namespace)]);
+        assert_eq!(nodes.state(), vec![Arc::new(node)]);
+        for task in tasks {
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+        }
+    }
+
+    fn label_filter_config(destination: &str) -> Config {
+        let mut config: Config = load(
+            indoc! {"
+            label_filters:
+              pod:
+                includes: ['app.*', 'app.kubernetes.io/*']
+                excludes: ['*/version']
+              namespace:
+                includes: []
+              node:
+                excludes: ['app.*']
+        "}
+            .as_bytes(),
+            Format::Yaml,
+        )
+        .unwrap();
+        if destination != "default" {
+            for (field, scope) in [
+                (&mut config.pod_annotation_fields.pod_labels, "pod"),
+                (
+                    &mut config.namespace_annotation_fields.namespace_labels,
+                    "namespace",
+                ),
+                (&mut config.node_annotation_fields.node_labels, "node"),
+            ] {
+                *field = if destination.is_empty() {
+                    vector_lib::lookup::lookup_v2::OptionalTargetPath::none()
+                } else {
+                    parse_target_path(&format!("custom.{scope}"))
+                        .unwrap()
+                        .into()
+                };
+            }
+        }
+        config
+    }
+
+    fn assert_filtered_enrichment(
+        log: &LogEvent,
+        log_namespace: LogNamespace,
+        destination: &str,
+        labels: &BTreeMap<String, String>,
+    ) {
+        assert_eq!(log.get(event_path!("message")), Some(&"original".into()));
+        assert_eq!(
+            log.get(metadata_path!("unrelated", "key")),
+            Some(&"preserved".into())
+        );
+        assert_eq!(
+            log.get(event_path!("kubernetes", "namespace_labels", "existing")),
+            Some(&"preserved".into())
+        );
+        assert_eq!(
+            log.get(metadata_path!(
+                "kubernetes_logs",
+                "namespace_labels",
+                "existing"
+            )),
+            Some(&"preserved".into())
+        );
+        for (scope, selected) in [
+            ("pod", Some("app.kubernetes.io/name")),
+            ("namespace", None),
+            ("node", Some("topology.kubernetes.io/zone")),
+        ] {
+            for (key, value) in labels {
+                let field = format!("{scope}_labels");
+                let target = match log_namespace {
+                    LogNamespace::Vector => OwnedTargetPath::metadata(owned_value_path!(
+                        "kubernetes_logs",
+                        field.as_str(),
+                        key.as_str()
+                    )),
+                    LogNamespace::Legacy if destination == "custom" => {
+                        OwnedTargetPath::event(owned_value_path!("custom", scope, key.as_str()))
+                    }
+                    LogNamespace::Legacy => OwnedTargetPath::event(owned_value_path!(
+                        "kubernetes",
+                        field.as_str(),
+                        key.as_str()
+                    )),
+                };
+                let expected = (selected == Some(key.as_str())
+                    && (log_namespace == LogNamespace::Vector || !destination.is_empty()))
+                .then(|| value.clone().into());
+                assert_eq!(
+                    log.get(&target),
+                    expected.as_ref(),
+                    "{log_namespace:?} {destination} {scope} {key}"
+                );
+            }
+        }
+        for field in ["pod_annotations", "namespace_annotations"] {
+            let target = match log_namespace {
+                LogNamespace::Vector => OwnedTargetPath::metadata(owned_value_path!(
+                    "kubernetes_logs",
+                    field,
+                    "app.kubernetes.io/name"
+                )),
+                LogNamespace::Legacy => OwnedTargetPath::event(owned_value_path!(
+                    "kubernetes",
+                    field,
+                    "app.kubernetes.io/name"
+                )),
+            };
+            assert_eq!(log.get(&target), Some(&"annotation".into()));
+        }
+        let name_path = match log_namespace {
+            LogNamespace::Vector => metadata_path!("kubernetes_logs", "pod_name"),
+            LogNamespace::Legacy => event_path!("kubernetes", "pod_name"),
+        };
+        assert_eq!(log.get(name_path), Some(&"test".into()));
+    }
 
     #[test]
     fn generate_config() {

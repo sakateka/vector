@@ -266,6 +266,47 @@ components: sources: kubernetes_logs: {
 					"""
 		}
 
+		label_filtering: {
+			title: "Label filtering"
+			body: """
+				Use `label_filters` to select which Pod, Namespace, and Node labels are copied
+				into each event. The three scopes are independent and default to all labels.
+				Omitted or `null` `includes` selects all keys before exclusions; `includes: []`
+				selects none. Omitted or empty `excludes` removes none, and exclusions always win.
+
+				Patterns match the entire key and are case-sensitive. Plain keys match exactly;
+				use `*` to match any sequence, including dots and slashes, or `?` for one character.
+				`[abc]` and `[a-z]` match a set or range, `[!abc]` negates a set, and brackets escape
+				metacharacters, for example `[*]`. Consecutive stars are only valid as a whole path
+				component (`**`); use `*` for label prefixes. Overlapping patterns copy each key
+				only once. Invalid glob patterns are configuration errors.
+
+				```yaml
+				sources:
+				  kubernetes:
+				    type: kubernetes_logs
+				    label_filters:
+				      pod:
+				        includes: ["app.kubernetes.io/*"]
+				        excludes: ["app.kubernetes.io/version"]
+				      namespace:
+				        includes: []
+				      node:
+				        excludes: ["cpu-feature.node.kubevirt.io/*"]
+				```
+
+				To copy only a Node's zone, set `label_filters.node.includes` to
+				`["topology.kubernetes.io/zone"]`. Other scopes still include all labels.
+
+				Filtering prunes labels from watch objects before they enter this source's caches.
+				Annotators copy the selected labels without matching patterns per event. Destination
+				paths and annotation behavior in both log namespaces are unchanged: selected labels
+				can overwrite the same destination keys, while excluded labels are not inserted.
+				Annotations, other object fields, server-side selectors, discovery, and deletion
+				behavior are unchanged.
+				"""
+		}
+
 		filtering: {
 			title: "Filtering"
 			body: """
